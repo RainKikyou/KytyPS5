@@ -241,7 +241,7 @@ struct CommandBuffer {
 
 	void DbgDump() const {
 		if (!Config::GraphicsDebugDumpEnabled() ||
-		    Config::GetPrintfDirection() == Config::LogDirection::Silent) {
+		    Config::GetPrintfDirection() == Config::OutputDirection::Silent) {
 			return;
 		}
 		static std::atomic<uint32_t> log_count {0};
