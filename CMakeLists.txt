@@ -85,6 +85,10 @@ else()
 	set(KYTY_PLATFORM KYTY_PLATFORM_WINDOWS)
 endif()
 
+if(WIN32)
+	add_compile_definitions(NOMINMAX)
+endif()
+
 set(CLANG FALSE)
 set(GCC FALSE)
 set(KYTY_CLANG_CL FALSE)
