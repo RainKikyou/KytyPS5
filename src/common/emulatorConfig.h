@@ -21,7 +21,11 @@ struct Lifecycle {
 
 enum class ShaderOptimizationType { None, Size, Performance };
 
-enum class LogDirection { Silent, Console, File };
+enum class ShaderLogDirection { Silent, Console, File };
+
+enum class ProfilerDirection { None, Network };
+
+enum class OutputDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
@@ -43,7 +47,7 @@ struct ConfigOptions {
 	uint32_t               screen_height               = 720;
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
-	PresentMode            present_mode                = PresentMode::Mailbox;
+	PresentMode            present_mode                = PresentMode::Fifo;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
@@ -51,14 +55,14 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
-	LogDirection           shader_log_direction        = LogDirection::Silent;
+	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
-	LogDirection           printf_direction            = LogDirection::Silent;
+	OutputDirection        printf_direction            = OutputDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
-	bool                   profiler_enabled            = false;
+	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
@@ -85,7 +89,7 @@ bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
-LogDirection           GetShaderLogDirection();
+ShaderLogDirection     GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 
 bool                  CommandBufferDumpEnabled();
@@ -93,10 +97,10 @@ std::filesystem::path GetCommandBufferDumpFolder();
 
 bool GraphicsDebugDumpEnabled();
 
-LogDirection          GetPrintfDirection();
+OutputDirection       GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
 
-bool ProfilerEnabled();
+ProfilerDirection GetProfilerDirection();
 
 bool SpirvDebugPrintfEnabled();
 
