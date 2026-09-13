@@ -1001,6 +1001,30 @@ private:
 		           : nullptr;
 	}
 
+	// A first-active-lane read may only enumerate the enabled load branch.
+	// Loop mask Phis are allowed when every incoming mask retains that enable.
+	static bool MaskRetainsEnable(Value mask, Value enable,
+	                              std::unordered_set<const Inst*>& visiting) {
+		mask = mask.Resolve();
+		if (mask == enable.Resolve()) { return true; }
+		if (mask.IsImmediate()) { return mask.GetType() == Type::U1 && !mask.U1(); }
+		const auto* inst = mask.TryInstruction();
+		if (inst == nullptr) { return false; }
+		if (!visiting.insert(inst).second) { return true; }
+		bool result = false;
+		if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+			result = MaskRetainsEnable(inst->Arg(0), enable, visiting) ||
+			         MaskRetainsEnable(inst->Arg(1), enable, visiting);
+		} else if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0u) {
+			result = true;
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				result &= MaskRetainsEnable(inst->Arg(index), enable, visiting);
+			}
+		}
+		visiting.erase(inst);
+		return result;
+	}
+
 	bool MatchReadLaneProbe(const Inst& key, uint32_t pc, uint32_t& material_source,
 	                        uint32_t& selector_offset, uint32_t& selector_stride,
 	                        uint32_t& item_bound, std::string& reason) {
@@ -1027,6 +1051,13 @@ private:
 		} else if (load->Arg(3).Resolve() != predicate) {
 			reason = "the select around the key load is not the load's enable";
 			return false;
+		}
+		if (key.GetOpcode() == ValueOpcode::ReadFirstLane) {
+			std::unordered_set<const Inst*> visiting;
+			if (!MaskRetainsEnable(key.Arg(1), predicate, visiting)) {
+				reason = "first-lane mask does not retain the key load enable";
+				return false;
+			}
 		}
 		auto* material_handle = load->Arg(0).Resolve().TryInstruction();
 		if (material_handle == nullptr) {

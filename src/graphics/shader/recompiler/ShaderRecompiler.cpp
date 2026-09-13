@@ -645,8 +645,24 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 
-	IR::CollectShaderInfo(ir, options.input_info);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	const ShaderVertexInputInfo*  vertex  = nullptr;
+	const ShaderPixelInputInfo*   pixel   = nullptr;
+	const ShaderComputeInputInfo* compute = nullptr;
+	switch (options.stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
+		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
+		case ShaderType::Compute: compute = options.input_info.compute; break;
+		default: EXIT("invalid shader stage\n");
+	}
+
+	IR::ShaderInfoOptions info_options;
+	info_options.vertex  = vertex;
+	info_options.pixel   = pixel;
+	info_options.compute = compute;
+	IR::CollectShaderInfo(ir, info_options);
+	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
+	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

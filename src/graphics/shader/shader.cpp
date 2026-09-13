@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -105,6 +106,21 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 }
 
+static uint64_t HashShaderCode(std::span<const uint32_t> code) {
+	// GPU ownership is byte-exact, whereas CPU protection covers whole pages.
+	// Hash current backing bytes when only unrelated data on the page is GPU dirty.
+	// Hash all code bytes every time: a partial fingerprint can miss code patches.
+	if (!code.empty() && code.size_bytes() <= 1024 * 1024) {
+		thread_local std::vector<uint32_t> scratch;
+		if (scratch.size() < code.size()) scratch.resize(code.size());
+		if (LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(
+		        reinterpret_cast<uint64_t>(code.data()), scratch.data(), code.size_bytes())) {
+			return XXH3_64bits(scratch.data(), code.size_bytes());
+		}
+	}
+	return XXH3_64bits(code.data(), code.size_bytes());
+}
+
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data) {
@@ -118,8 +134,7 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	return {
 	    .code      = code,
 	    .user_data = std::vector<uint32_t>(user_data.begin(), user_data.end()),
-	    .hash      = declared_hash != 0 ? declared_hash
-	                                    : XXH3_64bits(code.data(), code.size_bytes()),
+	    .hash      = declared_hash != 0 ? declared_hash : HashShaderCode(code),
 	};
 }
 

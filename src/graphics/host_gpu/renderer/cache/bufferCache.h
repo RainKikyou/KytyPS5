@@ -39,9 +39,11 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -55,6 +57,8 @@ public:
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
+	void ReportLodStats(void* dst, uint32_t size, bool reset);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
@@ -69,6 +73,13 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	struct SyncRegionRequest {
+		uint64_t address = 0, size = 0, cpu_epoch = 0, registration_epoch = 0;
+	};
+	void SynchronizeRegionRequest(SyncRegionRequest& request);
+	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
+
 	void               RunGarbageCollector();
 
 private:
@@ -112,10 +123,25 @@ private:
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
+	Buffer                                            m_lod_stats_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	uint64_t m_registration_epoch = 1;
+	struct SyncBuffer {
+		uint64_t start;
+		uint64_t end;
+		Buffer* buffer;
+	};
+	// GPU-thread-only derived index. SlotVector preserves addresses until erase;
+	// every registration change invalidates this view before it can be reused.
+	std::vector<SyncBuffer>                            m_sync_buffers;
+	bool                                              m_sync_buffers_valid = false;
+	struct SyncStamp { uint64_t begin = 0, end = 0, epoch = 0; };
+	std::vector<SyncStamp> m_sync_stamps;
+
+
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;

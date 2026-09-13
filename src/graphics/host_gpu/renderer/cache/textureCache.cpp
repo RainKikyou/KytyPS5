@@ -1948,6 +1948,21 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::HasTrackedDataOverlap(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) return true;
+	std::scoped_lock lock {m_lock};
+	return !FindImagesInRegion(address, size, false).empty();
+}
+
+bool BufferCache::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size) {
+	if (!GuestRange {begin, size}.Valid()) return false;
+	// Follow image -> buffer-region -> page lock order. Hold the image lock
+	// through invalidation so registration cannot introduce an alias in between.
+	std::scoped_lock lock(m_texture_cache.m_lock);
+	if (!m_texture_cache.FindImagesInRegion(begin, size, true).empty()) return false;
+	return m_memory_tracker.TryInvalidateCpuWriteWindow(fault, begin, size);
+}
+
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;

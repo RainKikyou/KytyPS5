@@ -5,6 +5,7 @@
 #else
 
 #include "common/assert.h"
+#include "common/pageProtectionTable.h"
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
@@ -31,7 +32,8 @@
 namespace Common {
 
 static pthread_mutex_t              g_virtual_mutex {};
-static std::map<uintptr_t, size_t>* g_allocs = nullptr;
+static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
+static PageProtectionTable*         g_protects = nullptr;
 
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
@@ -45,7 +47,8 @@ void SysVirtualInit() {
 	pthread_mutex_init(&g_virtual_mutex, &attr);
 	pthread_mutexattr_destroy(&attr);
 
-	g_allocs = new std::map<uintptr_t, size_t>;
+	g_allocs   = new std::map<uintptr_t, size_t>;
+	g_protects = new PageProtectionTable;
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -144,6 +147,9 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
+		uintptr_t page_start = ret_addr >> 12u;
+		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
+		g_protects->Set(page_start, page_end, static_cast<uint8_t>(protect));
 		pthread_mutex_unlock(&g_virtual_mutex);
 	}
 
@@ -229,6 +235,9 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	record_alloc(ret_addr, size);
+	uintptr_t page_start = ret_addr >> 12u;
+	uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
+	g_protects->Set(page_start, page_end, static_cast<uint8_t>(protect));
 	pthread_mutex_unlock(&g_virtual_mutex);
 
 	return ret_addr;
@@ -310,6 +319,9 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
+		uintptr_t page_start = ret_addr >> 12u;
+		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
+		g_protects->Set(page_start, page_end, static_cast<uint8_t>(protect));
 		pthread_mutex_unlock(&g_virtual_mutex);
 
 		return true;
@@ -484,7 +496,16 @@ bool SysVirtualFree(uint64_t address) {
 		return false;
 	}
 
-	return munmap(reinterpret_cast<void*>(addr), size) == 0;
+	if (munmap(reinterpret_cast<void*>(addr), size) == 0) {
+		uintptr_t page_start = addr >> 12u;
+		uintptr_t page_end   = (addr + size - 1) >> 12u;
+		pthread_mutex_lock(&g_virtual_mutex);
+		g_protects->Erase(page_start, page_end);
+		pthread_mutex_unlock(&g_virtual_mutex);
+		return true;
+	}
+
+	return false;
 }
 
 bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
@@ -539,16 +560,32 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	if (end < alloc_end) {
 		(*g_allocs)[end] = alloc_end - end;
 	}
+	g_protects->Erase(addr >> 12u, (end - 1u) >> 12u);
 	pthread_mutex_unlock(&g_virtual_mutex);
 	return true;
 }
 
-bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
-	const auto addr       = static_cast<uintptr_t>(address);
-	const auto page_start = addr >> 12u;
-	const auto page_end   = (addr + size - 1) >> 12u;
-	return mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
-	                get_protection_flag(mode)) == 0;
+bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
+                       VirtualMemory::Mode* old_mode) {
+	auto addr = static_cast<uintptr_t>(address);
+
+	pthread_mutex_lock(&g_virtual_mutex);
+	if (old_mode != nullptr) {
+		*old_mode = get_protection_flag(g_protects->Get(addr >> 12u));
+	}
+	pthread_mutex_unlock(&g_virtual_mutex);
+
+	uintptr_t page_start = addr >> 12u;
+	uintptr_t page_end   = (addr + size - 1) >> 12u;
+	if (mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
+	             get_protection_flag(mode)) == 0) {
+		pthread_mutex_lock(&g_virtual_mutex);
+		g_protects->Set(page_start, page_end, static_cast<uint8_t>(get_protection_flag(mode)));
+		pthread_mutex_unlock(&g_virtual_mutex);
+		return true;
+	}
+
+	return false;
 }
 
 bool SysVirtualFlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {

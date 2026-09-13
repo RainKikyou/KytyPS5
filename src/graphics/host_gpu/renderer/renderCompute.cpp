@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -187,7 +188,7 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
 		return false;
 	}
 	const uint64_t count = user_data[8];
-	const auto     size  = descriptor.GetSize();
+	const auto     size  = BufferDescriptorSize(descriptor);
 	if (count == 0 || size == 0 || size > UINT32_MAX || count * sizeof(uint32_t) != size ||
 	    group_x != (count + input.threads_num[0] - 1) / input.threads_num[0]) {
 		return false;
@@ -337,6 +338,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	if (indirect_args == 0 && DemonsSouls::TryLinearCopy(input_info, m_context.GetBufferCache(),
+	        thread_group_x, thread_group_y, thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
 	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
 	                                                     thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
@@ -458,16 +464,30 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
-	if (program.info.uses_dma) {
-		m_context.PrepareBda();
-	}
+	PrepareBdaBindings(bindings);
+	// Materialize the persistent argument owner before final descriptor handles:
+	// a tiny CPU upload must not leave an indirect command using a stream slice
+	// that can be retired when preparation rotates the command buffer.
+	if (indirect_args != 0)
+		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 	RebindBuffers(bindings);
 	RebindImages(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
+	vk::Buffer indirect_buffer = nullptr;
+	uint64_t indirect_offset = 0;
+	if (indirect_args != 0) {
+		auto& cache     = m_context.GetBufferCache();
+		auto& owner     = cache.GetBuffer(cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t)));
+		indirect_buffer = owner.Handle();
+		indirect_offset = owner.Offset(indirect_args);
+	}
+
+	const bool chain = DemonsSouls::IsSupportedGame();
+	auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
+	               std::span {&descriptor_stage, 1u}, chain);
+	const bool continues_chain = chain && buffer.ComputeChainPending();
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -477,15 +497,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	if (has_storage_writes && !continues_chain) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (indirect_args != 0) {
-		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
@@ -494,20 +512,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
 		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.buffer              = args_buffer->Handle();
-		args_barrier.offset              = args_offset;
+		args_barrier.buffer              = indirect_buffer;
+		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		if (!continues_chain) vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                          vk::PipelineStageFlagBits::eDrawIndirect,
 		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
-		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (chain) buffer.ContinueComputeChain();
+	else ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetCommandScheduler().CompleteDispatch();
 }
 
 } // namespace Libs::Graphics

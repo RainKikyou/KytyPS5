@@ -2390,7 +2390,9 @@ static uint64_t FiberGetOwner(FiberObject* fiber) {
 	return it != g_fiber_owner_thread.end() ? it->second : 0;
 }
 
-static void FiberSetCurrentFiber(FiberObject* fiber) {
+// Fibers may resume on another host thread. Resolve TLS inside this call,
+// rather than reusing a thread pointer cached before saving the context.
+__attribute__((noinline)) static void FiberSetCurrentFiber(FiberObject* fiber) {
 	g_current_fiber = fiber;
 
 	std::lock_guard lock(g_fiber_owner_mutex);
@@ -2402,7 +2404,7 @@ static void FiberSetCurrentFiber(FiberObject* fiber) {
 	}
 }
 
-static void FiberStoreState(FiberObject* fiber, uint32_t state) {
+__attribute__((noinline)) static void FiberStoreState(FiberObject* fiber, uint32_t state) {
 	std::atomic_ref<uint32_t>(fiber->state).store(state, std::memory_order_release);
 	if (state == FIBER_STATE_RUNNING) {
 		FiberSetOwner(fiber);
@@ -2415,7 +2417,7 @@ static void FiberDeferIdle(FiberObject* fiber) {
 	g_pending_idle_fiber = fiber;
 }
 
-static void FiberCommitDeferredIdle() {
+__attribute__((noinline)) static void FiberCommitDeferredIdle() {
 	auto* fiber          = g_pending_idle_fiber;
 	g_pending_idle_fiber = nullptr;
 	if (fiber != nullptr) {

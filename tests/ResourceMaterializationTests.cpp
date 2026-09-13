@@ -248,6 +248,136 @@ void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
         "point sampler variant duplicated the wrong runtime descriptor");
 }
 
+void TestBdaReadPlanIntervals() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.info.uses_dma = true;
+  program.user_data_base = 12;
+  program.user_data_count = 2;
+  auto& block = AddValueBlock(program);
+  const auto emit = [&](ValueOpcode op, std::initializer_list<Value> args) {
+    return Value(&block.AppendNewInst(op, args));
+  };
+  const auto low = emit(ValueOpcode::GetUserData, {Value(ScalarReg{12})});
+  const auto high = emit(ValueOpcode::GetUserData, {Value(ScalarReg{13})});
+  const auto handle = emit(ValueOpcode::GetAddressResource, {low, high});
+  const auto x = emit(ValueOpcode::UndefU32, {});
+  const auto condition = emit(ValueOpcode::ULessThan32, {x, Value(4u)});
+  const auto active = emit(ValueOpcode::LogicalAnd, {condition, Value(true)});
+  const auto sum = emit(ValueOpcode::IAdd32, {x, Value(33u)});
+  const auto shift = emit(ValueOpcode::ShiftLeftLogical32, {sum, Value(6u)});
+  const auto selected = emit(ValueOpcode::SelectU32, {condition, shift, Value(UINT32_MAX)});
+  auto& load = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {handle, selected, Value(0u), active});
+  load.SetFlags(MemoryFlags{0, 0});
+  program.memory_info.push_back({.kind = ResourceKind::Global, .offset = 4});
+  ResourceSnapshot snapshot;
+  snapshot.user_data = {0x10000u, 9u};
+  std::vector<Libs::Graphics::GuestRange> ranges;
+  auto plan = BuildBdaReadPlan(program);
+  Check(plan.complete && plan.spans.size() == 1 && plan.spans[0].begin == 33 * 64 + 4 &&
+        plan.spans[0].end == 36 * 64 + 8 && EvaluateBdaReadPlan(plan, snapshot, ranges),
+        "guarded dynamic address did not retain its proven unsigned bounds");
+  Check(ranges.size() == 1 && ranges[0].address == 0x900010844ull && ranges[0].size == 196,
+        "bounded plan did not resolve runtime user data or preserve its last word");
+
+  // A guard does not constrain a load that executes outside it, including a
+  // selected inactive address. The broad range must include U32 wraparound.
+  load.SetArg(3, Value(true));
+  plan = BuildBdaReadPlan(program);
+  Check(plan.complete && plan.spans[0].begin == 4 && plan.spans[0].end == int64_t(UINT32_MAX) + 8,
+        "unguarded selection incorrectly borrowed a condition from its true arm");
+  const auto wrapping = emit(ValueOpcode::IAdd32, {x, Value(UINT32_MAX)});
+  load.SetArg(1, wrapping);
+  plan = BuildBdaReadPlan(program);
+  Check(plan.spans[0].begin == 4 && plan.spans[0].end == int64_t(UINT32_MAX) + 8,
+        "wrapping addition narrowed an unknown address");
+  const auto aligned = emit(ValueOpcode::ShiftLeftLogical32, {x, Value(4u)});
+  load.SetArg(1, aligned);
+  plan = BuildBdaReadPlan(program);
+  Check(plan.spans[0].begin == 4 && plan.spans[0].end == int64_t(0xfffffff0u) + 8,
+        "wrapping left shift lost its conservative alignment bound");
+  const auto masked = emit(ValueOpcode::BitwiseAnd32, {x, Value(255u)});
+  const auto product = emit(ValueOpcode::IMul32, {masked, Value(12u)});
+  load.SetArg(1, product);
+  plan = BuildBdaReadPlan(program);
+  Check(plan.spans[0].begin == 4 && plan.spans[0].end == 255 * 12 + 8,
+        "masked multiplication did not cover all possible indices");
+
+  // Shared expression DAGs must terminate without treating incomplete analysis
+  // as an empty footprint or relying on any observed runtime value.
+  auto dag = x;
+  for (unsigned i = 0; i < 80; ++i) dag = emit(ValueOpcode::IAdd32, {dag, dag});
+  load.SetArg(1, dag);
+  plan = BuildBdaReadPlan(program);
+  Check(plan.complete && plan.spans[0].end == int64_t(UINT32_MAX) + 8,
+        "bounded analysis budget lost an unknown address dependency");
+
+  program.memory_info[0].kind = ResourceKind::ScalarAddress;
+  program.memory_info[0].offset = uint32_t(-1);
+  load.SetArg(1, Value(7u));
+  snapshot.user_data = {0x10003u, 0xabcd0009u};
+  plan = BuildBdaReadPlan(program);
+  Check(EvaluateBdaReadPlan(plan, snapshot, ranges) && ranges.size() == 1 &&
+        ranges[0].address == 0x900010000ull && ranges[0].size == 4,
+        "SMEM plan did not separately mask its 48-bit base, offset and immediate");
+
+  program.memory_info[0].kind = ResourceKind::Global;
+  program.memory_info[0].offset = uint32_t(-4);
+  program.memory_info[0].address_is_full = true;
+  load.SetArg(1, Value(0x10001u));
+  load.SetArg(2, Value(9u));
+  plan = BuildBdaReadPlan(program);
+  Check(EvaluateBdaReadPlan(plan, snapshot, ranges) && ranges.size() == 1 &&
+        ranges[0].address == 0x90000fffCull && ranges[0].size == 8,
+        "full unaligned address did not include both physical dword loads");
+  load.SetArg(1, x);
+  Check(!BuildBdaReadPlan(program).complete, "dynamic full-address base was accepted");
+  program.memory_info[0].address_is_full = false;
+  load.SetArg(1, Value(0u));
+  auto& store = block.AppendNewInst(ValueOpcode::StoreAddressU32,
+      {handle, Value(0u), Value(0u), Value(1u), Value(true)});
+  store.SetFlags(MemoryFlags{0, 0});
+  Check(!BuildBdaReadPlan(program).complete, "address store was accepted as a read-only footprint");
+}
+
+void TestBdaReadPlanTransactions() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Kind = BdaReadWord::Kind;
+  BdaReadPlan plan;
+  plan.complete = true;
+  plan.spans = {{{Kind::Flat, 0}, {Kind::Flat, 1}, 1, 7, false},
+                {{Kind::Immediate, 0x10004}, {Kind::Immediate, 9}, 0, 8, false}};
+  ResourceSnapshot snapshot;
+  snapshot.flattened_srt = {0x10000, 9};
+  std::vector<GuestRange> ranges;
+  Check(EvaluateBdaReadPlan(plan, snapshot, ranges) &&
+        ranges == std::vector<GuestRange>{{0x900010000ull, 12}},
+        "flat pointer, unaligned spans or overlapping bases were not merged correctly");
+  const auto saved = ranges;
+  snapshot.flattened_srt.pop_back();
+  Check(!EvaluateBdaReadPlan(plan, snapshot, ranges) && ranges == saved,
+        "missing flat word partially replaced a prior valid footprint");
+  snapshot.flattened_srt = {0x10000, 9};
+  plan.spans[0].begin = INT64_MIN;
+  Check(!EvaluateBdaReadPlan(plan, snapshot, ranges) && ranges == saved,
+        "signed underflow produced an address or changed the prior footprint");
+  plan.spans[0].begin = 0;
+  plan.spans[0].end = INT64_MAX;
+  Check(!EvaluateBdaReadPlan(plan, snapshot, ranges) && ranges == saved,
+        "out-of-tracker read was accepted");
+  snapshot.flattened_srt = {UINT32_MAX, UINT32_MAX};
+  plan.spans[0].end = 4;
+  Check(!EvaluateBdaReadPlan(plan, snapshot, ranges) && ranges == saved,
+        "overflowing 64-bit address was accepted");
+  snapshot.flattened_srt = {0xfffffffcu, 0xffu};
+  plan.spans.resize(1);
+  Check(EvaluateBdaReadPlan(plan, snapshot, ranges) &&
+        ranges == std::vector<GuestRange>{{TRACKER_ADDRESS_SIZE - 4, 4}},
+        "last valid tracker dword was rejected");
+}
+
 } // namespace
 
 namespace Common {
@@ -265,6 +395,8 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestBdaReadPlanIntervals();
+  TestBdaReadPlanTransactions();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();

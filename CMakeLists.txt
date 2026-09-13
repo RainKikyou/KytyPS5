@@ -391,11 +391,12 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -404,6 +405,21 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_executable(demons_souls_copy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DemonsSoulsCopyTests.cpp")
+target_link_libraries(demons_souls_copy_tests xbyak::xbyak)
+target_include_directories(demons_souls_copy_tests PRIVATE ${inc_headers})
+
+add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp")
+target_link_libraries(demons_souls_idle_tests xbyak::xbyak)
+target_include_directories(demons_souls_idle_tests PRIVATE ${inc_headers})
+
+add_executable(page_protection_table_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PageProtectionTableTests.cpp")
+target_link_libraries(page_protection_table_tests fmt::fmt common)
+target_include_directories(page_protection_table_tests PRIVATE ${inc_headers})
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
@@ -434,16 +450,18 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
@@ -454,7 +472,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -475,6 +493,11 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
+target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
+add_kyty_full_emulator_test(fiber_migration_tests
+	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -541,25 +564,37 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
+	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
+	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME save_data_capacity COMMAND $<TARGET_FILE:save_data_capacity_tests>)
+	add_test(NAME fiber_migration COMMAND $<TARGET_FILE:fiber_migration_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME native_dispatch_indirect
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-dispatch-indirect-only)
+	add_test(NAME cpu_write_window COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cpu-write-window-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
-	add_test(NAME graphics_pipeline_rasterization
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
-	add_test(NAME graphics_draw_offsets
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME guest_stack_exit
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-exit-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	add_test(NAME shader_lod_feedback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lodstats-gpu-only)
+	add_test(NAME demons_souls_compute_chain
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --demons-compute-chain-only)
+	add_test(NAME compute_stream_submission
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --streaming-compute-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring
@@ -609,6 +644,8 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		fiber_migration_tests
+		save_data_capacity_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests

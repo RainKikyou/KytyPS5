@@ -223,6 +223,7 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
+	m_draw_run_skip = 0;
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
@@ -343,6 +344,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	BreakComputeChain();
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -763,6 +765,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		if (opcode != Pm4::IT_DRAW_INDEX_INDIRECT) m_draw_run_skip = 0;
+		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
+			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
+			if (consumed) {
+				execution.m_buffer_stack[buffer_index].offset_dw += consumed;
+				execution.m_made_progress = true;
+				continue;
+			}
+		}
+
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -887,6 +899,70 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
+	constexpr uint32_t max_draws = 64;
+	if (m_draw_run_skip) {
+		--m_draw_run_skip;
+		return 0;
+	}
+	if (packets.size() < 10 || m_index_type_and_size > 1 || !m_index_base_addr ||
+	    !m_draw_indirect_args_base_addr ||
+	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
+		return 0;
+	uint32_t count = 1;
+	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
+		const auto* next = packets.data() + count * 5u;
+		if (next[0] != 0xc0032500u || next[2] != packets[2] || next[3] != packets[3] ||
+		    next[4] != packets[4])
+			break;
+		++count;
+	}
+	if (count < 2 || (packets[4] & ~0x20u) != 2u) return 0;
+	// A rejected run must not be prepared N, N-1, ... times on fallback.
+	m_draw_run_skip                                = count - 1;
+	auto&                                resources = GetGpuResources();
+	std::array<DrawIndexArgs, max_draws> draws {};
+	std::array<uint64_t, max_draws>      argument_addresses {};
+	const uint32_t                       element_size = m_index_type_and_size == 0 ? 2 : 4;
+	uint32_t                             active = 0, last_instances = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		const uint64_t address = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
+		argument_addresses[i]  = address;
+		if (address < m_draw_indirect_args_base_addr || (address & 3u) ||
+		    !resources.IsMapped(address, sizeof(DrawIndexedIndirectArgs)) ||
+		    !LibKernel::Memory::SyncGpuCleanBacking(address, sizeof(DrawIndexedIndirectArgs)))
+			return 0;
+		DrawIndexedIndirectArgs args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(address), sizeof(args));
+		last_instances         = args.instance_count;
+		const uint32_t indices = m_index_buffer_size
+		                             ? std::min(args.index_count_per_instance, m_index_buffer_size)
+		                             : args.index_count_per_instance;
+		if (!indices || !args.instance_count) continue;
+		const uint64_t index_address =
+		    m_index_base_addr + uint64_t(args.start_index_location) * element_size;
+		if (index_address < m_index_base_addr ||
+		    !resources.IsMapped(index_address, uint64_t(indices) * element_size))
+			return 0;
+		draws[active++] = {.index_count         = indices,
+		                   .index_addr          = reinterpret_cast<const void*>(index_address),
+		                   .instance_count      = args.instance_count,
+		                   .index_type_and_size = m_index_type_and_size,
+		                   .base_vertex         = static_cast<int32_t>(args.base_vertex_location),
+		                   .first_instance      = args.start_instance_location,
+		                   .offset_source       = DrawOffsetSource::IndirectArgs};
+	}
+	if (active < 2) return 0;
+	CheckBuffer();
+	if (!m_renderer.GetRenderExecutor().TryDrawIndexRun(m_submit_id, CurrentBuffer(),
+	                                                    {draws.data(), active},
+	                                                    {argument_addresses.data(), count})) {
+		return 0;
+	}
+	m_num_instances = last_instances;
+	m_draw_run_skip = 0;
+	return count * 5u;
+}
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
@@ -1161,15 +1237,25 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
-	struct DispatchIndirectArgs {
-		uint32_t thread_group_x;
-		uint32_t thread_group_y;
-		uint32_t thread_group_z;
-	};
-
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
+	DispatchIndirectAddress(m_dispatch_indirect_args_base_addr + data_offset, mode);
+}
 
-	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
+void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode) {
+	struct DispatchIndirectArgs {
+		uint32_t thread_group_x, thread_group_y, thread_group_z;
+	};
+	EXIT_NOT_IMPLEMENTED(args_addr == 0);
+	// Workgroup dimensions are consumed by Vulkan. Only thread-dimension mode
+	// needs CPU counts for specialization/conversion; do not download GPU-written
+	// arguments solely to pass unused group counts back to the indirect command.
+	if ((mode & 0x20u) == 0 && (args_addr & 3u) == 0 &&
+	    GetGpuResources().IsMapped(args_addr, sizeof(DispatchIndirectArgs)) &&
+	    !GetGpuResources().GetTextureCache().IsRegionGpuModified(args_addr,
+	                                                             sizeof(DispatchIndirectArgs))) {
+		DispatchDirect(1, 1, 1, mode, args_addr);
+		return;
+	}
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
 		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -1209,6 +1295,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	CheckBuffer();
+	BreakComputeChain();
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);
@@ -1470,13 +1557,22 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().HandleForFullBarrier().pipelineBarrier2(dependency);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	CheckBuffer();
 
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), m_interrupt_event_id, interrupt_context_id);
+}
+
+void CommandProcessor::BreakComputeChain() {
+	// Guest synchronization may be implemented without a host command.
+	// It still ends the compatibility profile's independent dispatch group.
+	if (!GetScheduler().Active()) return;
+	Common::LockGuard lock(m_renderer.GetMutex());
+	auto& buffer = CurrentBuffer();
+	if (buffer.ComputeChainPending()) (void)buffer.Handle();
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1527,6 +1623,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
+			BreakComputeChain();
 			break;
 		case 0x00000039: {
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {

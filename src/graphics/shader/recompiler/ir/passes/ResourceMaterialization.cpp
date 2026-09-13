@@ -499,8 +499,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		return note("material table is too large to enumerate");
 	}
 
-	MakeRangeReadable(runtime, material.Base48() & ~uint64_t {3}, material.GetSize());
-	MakeRangeReadable(runtime, heap.Base48() & ~uint64_t {3}, heap.GetSize());
+	MakeRangeReadable(runtime, material.Base48() & ~uint64_t {3}, ScalarBufferSize(material));
+	MakeRangeReadable(runtime, heap.Base48() & ~uint64_t {3}, ScalarBufferSize(heap));
 	std::vector<uint32_t>        keys {0u};
 	std::unordered_set<uint32_t> seen {0u};
 	keys.reserve(static_cast<size_t>(probe_count) + 1u);
@@ -775,6 +775,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		                             : Prospero::BufferFormat::kInvalid,
 		    .descriptor_swizzle =
 		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
+		    .byte_base_offset = (descriptor.Base48() & 3u) != 0,
 		});
 	}
 	for (uint32_t i = 0; i < next_specialization.images.size(); i++) {
@@ -1277,6 +1278,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
+	BuildLinearSrtPlan(plan);
 	return plan;
 }
 
@@ -1305,6 +1307,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
+		buffers[index].byte_base_offset   = specialization.buffers[index].byte_base_offset;
 	}
 	auto images = program.info.images;
 	images.reserve(specialization.images.size());

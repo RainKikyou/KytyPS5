@@ -33,6 +33,8 @@ public:
 
 	static void Sleep(uint32_t millis);
 	static void SleepMicro(uint32_t micros);
+	// Idle workers must yield CPU time even for a short delay.
+	static void SleepMicroWithoutSpinning(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
 

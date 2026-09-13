@@ -16,6 +16,8 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsCopy.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -1486,6 +1488,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1509,6 +1513,8 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	DemonsSoulsIdle::Clear();
+	DemonsSoulsCopy::Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);

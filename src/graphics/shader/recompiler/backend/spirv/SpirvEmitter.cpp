@@ -4,8 +4,11 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
+
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -73,6 +76,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	if (uses_gds) {
 		Expect(Kind::Gds);
+	}
+	if (program.bindings.lod_stats_count != 0) {
+		if (program.stage != ShaderType::Pixel || program.bindings.lod_stats_count != program.info.images.size()) {
+			Fail(program, "LOD feedback metadata does not match pixel images");
+		}
+		Expect(Kind::LodStats);
 	}
 	if (program.info.uses_dma) {
 		Expect(Kind::BdaPagetable);
@@ -247,7 +256,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot:
-				case IR::ValueOpcode::AnyLane: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::AnyLane: MarkBallot(); break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
@@ -317,11 +326,24 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
+	state.stage     = program.stage;
+	state.lod_stats_subgroup = program.bindings.lod_stats_count != 0 &&
+	    input_info.pixel != nullptr && input_info.pixel->lod_stats_subgroup;
+
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	const auto function_lds = IR::PlanFunctionLdsLayout(program);
+	state.function_lds_slots = function_lds.slots;
+	state.compact_lds_dwords = function_lds.dwords;
+	state.inputs.reserve(program.info.inputs.size());
+	state.outputs.reserve(program.info.outputs.size());
+	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
+	CopyProgramInputsAndOutputs(state, program);
+	AllocateInputVariables(state);
+	AllocateOutputVariables(state);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

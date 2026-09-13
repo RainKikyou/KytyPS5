@@ -72,10 +72,12 @@ public:
 	void SetIndexBufferSize(uint32_t index_buffer_size);
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
+	void     DispatchIndirectAddress(uint64_t args_address, uint32_t mode);
 	void SetNumInstances(uint32_t num_instances);
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
+	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
@@ -95,6 +97,7 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
+	void BreakComputeChain();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode, uint64_t indirect_args = 0);
@@ -120,6 +123,7 @@ public:
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	void ReportLodStats(void* dst, uint32_t size, bool reset) { GetGpuResources().GetBufferCache().ReportLodStats(dst, size, reset); }
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
@@ -138,6 +142,7 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	uint32_t m_draw_run_skip = 0;
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,

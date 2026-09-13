@@ -134,6 +134,7 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		std::array<std::atomic<uint8_t>, REGION_PAGES> read_hint {};
 	};
 
 	Impl() {
@@ -223,6 +224,9 @@ struct PageManager::Impl {
 			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
+			if constexpr (is_read) {
+				region.read_hint[page_index].store(new_count != 0, std::memory_order_release);
+			}
 
 			if (new_perms != perms) [[unlikely]] {
 				release_pending();
@@ -280,6 +284,18 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+bool PageManager::HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
+	if (!GuestRange {vaddr, size}.Valid()) return false;
+	const auto end = PageStart(vaddr + size - 1);
+	for (auto page = PageStart(vaddr);; page += PAGE_SIZE) {
+		if (const auto* region = m_impl->FindRegion(page);
+		    region != nullptr &&
+		    region->read_hint[(page % REGION_SIZE) / PAGE_SIZE].load(std::memory_order_acquire))
+			return true;
+		if (page == end) return false;
+	}
 }
 
 template <bool track>

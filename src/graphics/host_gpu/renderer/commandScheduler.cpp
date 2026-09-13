@@ -98,6 +98,21 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
+void CommandScheduler::CompleteDispatch() {
+	// Expose command-processor/GPU overlap without a host fence. Bound the
+	// recording batch; resource retirement still uses the submission timeline.
+	constexpr uint32_t DispatchesPerSubmission = 32;
+	if (++m_recorded_dispatches < DispatchesPerSubmission) return;
+	CheckActive();
+	m_command.EndRendering();
+	VulkanMemoryBarrier dependency {};
+	dependency.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	dependency.dstAccessMask = dependency.srcAccessMask;
+	m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &dependency,
+	                                   0, nullptr, 0, nullptr);
+	Flush();
+}
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
 }
@@ -388,6 +403,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	m_recorded_dispatches = 0;
 	return tick;
 }
 

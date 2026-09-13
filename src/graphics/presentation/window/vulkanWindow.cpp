@@ -493,10 +493,61 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
-static vk::Device VulkanCreateDevice(GraphicContext& graphics,
-	                                 const std::vector<const char*>& device_extensions) {
-	const auto physical_device = graphics.physical_device;
-	const auto queue_family    = graphics.queue_family;
+static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
+                                          GraphicContext&    graphics) {
+	EXIT_IF(physical_device == nullptr);
+
+	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
+	subgroup_size_control.sType = vk::StructureType::ePhysicalDeviceSubgroupSizeControlProperties;
+	subgroup_size_control.pNext = nullptr;
+
+	vk::PhysicalDeviceVulkan11Properties properties11 {};
+	properties11.sType = vk::StructureType::ePhysicalDeviceVulkan11Properties;
+	properties11.pNext = &subgroup_size_control;
+
+	vk::PhysicalDeviceProperties2 properties2 {};
+	properties2.sType = vk::StructureType::ePhysicalDeviceProperties2;
+	properties2.pNext = &properties11;
+
+	physical_device.getProperties2(&properties2);
+
+	vk::PhysicalDeviceVulkan13Features features13 {};
+	features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
+	features13.pNext = nullptr;
+
+	vk::PhysicalDeviceFeatures2 features2 {};
+	features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
+	features2.pNext = &features13;
+
+	physical_device.getFeatures2(&features2);
+
+	constexpr auto reductions = vk::SubgroupFeatureFlagBits::eBasic |
+	                            vk::SubgroupFeatureFlagBits::eVote |
+	                            vk::SubgroupFeatureFlagBits::eArithmetic;
+	graphics.fragment_subgroup_reduction =
+	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
+	    (properties11.subgroupSupportedOperations & reductions) == reductions;
+	graphics.subgroup_size                 = properties11.subgroupSize;
+	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
+	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
+	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
+	graphics.compute_subgroup_size_control_enabled =
+	    features13.subgroupSizeControl == VK_TRUE &&
+	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
+	    subgroup_size_control.minSubgroupSize <= 64 &&
+	    subgroup_size_control.maxSubgroupSize >= 64;
+
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
+	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
+	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
+	     graphics.SupportsComputeWave64() ? "true" : "false");
+}
+
+static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
+                                     uint32_t                        queue_family,
+                                     const std::vector<const char*>& device_extensions,
+                                     GraphicContext&                 graphics) {
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 

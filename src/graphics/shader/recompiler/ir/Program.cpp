@@ -131,6 +131,7 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
+	    .bda_read_plan = BuildBdaReadPlan(*this),
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
 	    .wave_size       = wave_size,

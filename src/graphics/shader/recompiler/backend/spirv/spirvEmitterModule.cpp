@@ -239,6 +239,38 @@ void DefineDescriptors(EmitterState& state) {
 				break;
 			}
 		}
+		const auto& image        = state.program.info.images.at(binding.resources.front());
+		const auto  count        = ConstantU32(state, DescriptorCount(state, binding.kind));
+		const auto  image_type   = ImageType(state, image);
+		const auto  array_type   = state.builder.Type(OpTypeArray, {image_type, count});
+		const auto  pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
+		state.image_variables[IR::ImageBindingIndex(binding.kind)] =
+		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
+		if (image.dimension == ImageDimension::Dim1D ||
+		    image.dimension == ImageDimension::Dim1DArray) {
+			const auto capability = image.resource_class == IR::ImageResourceClass::Sampled
+			                            ? CapabilitySampled1D
+			                            : CapabilityImage1D;
+			state.builder.RequireCapability(capability);
+		}
+	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::Samplers) != nullptr) {
+		const auto sampler_type = state.builder.Type(OpTypeSampler);
+		const auto count =
+		    ConstantU32(state, DescriptorCount(state, IR::DescriptorBindingKind::Samplers));
+		const auto array_type   = state.builder.Type(OpTypeArray, {sampler_type, count});
+		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
+		state.sampler_variable =
+		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
+	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::LodStats) != nullptr) {
+		state.lod_stats_variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
+		                                                        StorageClassStorageBuffer);
+		state.builder.RequireCapability(CapabilityImageQuery);
+	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::Gds) != nullptr) {
+		state.gds_variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
+		                                                        StorageClassStorageBuffer);
 	}
 }
 
@@ -362,11 +394,18 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	}
 }
 
-void DefineInputs(EmitterState& state) {
-	state.inputs.reserve(state.program.info.inputs.size());
-	for (const auto& input: state.program.info.inputs) {
-		state.inputs.push_back({input});
+static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
+	return state.stage == ShaderType::Pixel &&
+	       index < std::size(state.input_info.pixel->target_output_mode) &&
+	       state.input_info.pixel->target_output_mode[index] == 7u;
+}
+
+void AllocateInputVariables(EmitterState& state) {
+	if (state.lod_stats_subgroup) {
+		state.lod_helper_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.lod_helper_variable);
 	}
+
 	if (state.lane_count == 2) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
@@ -414,8 +453,46 @@ void DefineInputs(EmitterState& state) {
 				break;
 			default: break;
 		}
-		input.variable_id =
-		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());
+	}
+}
+
+uint32_t BuiltInForInput(IR::StageInputKind kind) {
+	switch (kind) {
+		case IR::StageInputKind::VertexIndex: return BuiltInVertexIndex;
+		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
+		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
+		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
+		case IR::StageInputKind::Layer: return BuiltInLayer;
+		case IR::StageInputKind::SampleId: return BuiltInSampleId;
+		case IR::StageInputKind::BaryCoordSmooth: return BuiltInBaryCoordKHR;
+		case IR::StageInputKind::BaryCoordNoPerspective: return BuiltInBaryCoordNoPerspKHR;
+		case IR::StageInputKind::WorkgroupId: return BuiltInWorkgroupId;
+		case IR::StageInputKind::LocalInvocationId: return BuiltInLocalInvocationId;
+		case IR::StageInputKind::LocalInvocationIndex: return BuiltInLocalInvocationIndex;
+		case IR::StageInputKind::GlobalInvocationId: return BuiltInGlobalInvocationId;
+		default: return UINT32_MAX;
+	}
+}
+
+void AddInputAnnotationsAndNames(EmitterState& state) {
+	if (state.lod_helper_variable != 0) {
+		state.builder.AddName(state.lod_helper_variable, "gl_HelperInvocation");
+		state.builder.AddAnnotation({OpDecorate, state.lod_helper_variable,
+		                             DecorationBuiltIn, BuiltInHelperInvocation});
+	}
+
+	if (state.subgroup_local_invocation_id_variable != 0) {
+		state.builder.AddName(state.subgroup_local_invocation_id_variable,
+		                      "gl_SubgroupInvocationID");
+		state.builder.AddAnnotation({OpDecorate, state.subgroup_local_invocation_id_variable,
+		                             DecorationBuiltIn, BuiltInSubgroupLocalInvocationId});
+		if (state.stage == ShaderType::Pixel) {
+			state.builder.AddAnnotation(
+			    {OpDecorate, state.subgroup_local_invocation_id_variable, DecorationFlat});
+		}
+	}
+	for (const auto& input: state.inputs) {
+		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
@@ -536,7 +613,73 @@ void DefineOutputs(EmitterState& state) {
 	}
 }
 
-} // namespace
+void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name,
+                        IR::DescriptorBindingKind kind) {
+	if (variable == 0) {
+		return;
+	}
+	state.builder.AddName(variable, name);
+	state.builder.AddAnnotation({OpDecorate, variable, DecorationDescriptorSet, 0});
+	state.builder.AddAnnotation(
+	    {OpDecorate, variable, DecorationBinding, IR::NativeBinding(state.program.stage, kind)});
+}
+
+void AddDescriptorAnnotationsAndNames(EmitterState& state) {
+	auto Decorate = [&](uint32_t variable, const char* name, IR::DescriptorBindingKind kind) {
+		DecorateDescriptor(state, variable, name, kind);
+	};
+	if (state.storage_buffer_variable != 0) {
+		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
+	}
+	if (state.storage_buffer_u64_variable != 0) {
+		Decorate(state.storage_buffer_u64_variable, "buffers_u64",
+		         IR::DescriptorBindingKind::Buffers);
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.storage_buffer_variable, DecorationAliased});
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.storage_buffer_u64_variable, DecorationAliased});
+	}
+	if (state.bda_pagetable_variable != 0) {
+		Decorate(state.bda_pagetable_variable, "bda_pagetable",
+		         IR::DescriptorBindingKind::BdaPagetable);
+	}
+	if (state.fault_buffer_variable != 0) {
+		Decorate(state.fault_buffer_variable, "fault_buffer",
+		         IR::DescriptorBindingKind::FaultBuffer);
+	}
+	for (const auto& binding: state.program.bindings.descriptors) {
+		if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::None) {
+			continue;
+		}
+		const auto name = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
+		Decorate(state.image_variables[IR::ImageBindingIndex(binding.kind)], name.c_str(),
+		         binding.kind);
+	}
+	if (state.sampler_variable != 0) {
+		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
+	}
+	if (state.lod_stats_variable != 0) {
+		Decorate(state.lod_stats_variable, "lod_stats", IR::DescriptorBindingKind::LodStats);
+	}
+	if (state.gds_variable != 0) {
+		Decorate(state.gds_variable, "gds", IR::DescriptorBindingKind::Gds);
+	}
+	if (state.flattened_srt_variable != 0) {
+		Decorate(state.flattened_srt_variable, "flattened_srt",
+		         IR::DescriptorBindingKind::FlattenedSrt);
+	}
+}
+
+void AddVsharpAnnotationsAndNames(EmitterState& state) {
+	if (state.push_constant_variable != 0) {
+		state.builder.AddName(PushConstantBlockType(state), "BufferResource");
+		state.builder.AddName(state.push_constant_variable, "vsharp");
+	}
+	if (state.shader_data_storage_variable != 0) {
+		DecorateDescriptor(state, state.shader_data_storage_variable, "shader_data",
+		                   IR::DescriptorBindingKind::ShaderData);
+	}
+}
 
 void DefineModule(EmitterState& state) {
 	state.interface_variables.reserve(state.program.info.inputs.size() +
@@ -596,6 +739,11 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
+	}
+	if (state.lod_stats_subgroup) {
+		state.builder.RequireCapability(CapabilityGroupNonUniform);
+		state.builder.RequireCapability(CapabilityGroupNonUniformVote);
+		state.builder.RequireCapability(CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
 	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
@@ -670,6 +818,119 @@ void DefineModule(EmitterState& state) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.builder.AddName(state.scratch_variable[half], "scratch_dwords");
 		}
+	}
+	if (state.lod_helper_variable != 0) {
+		state.builder.DefineGlobalVariable(state.lod_helper_variable,
+		    TypePointer(state, StorageClassInput, TypeBool(state)), StorageClassInput);
+	}
+	AddInputAnnotationsAndNames(state);
+	AddOutputAnnotationsAndNames(state);
+	AddDescriptorAnnotationsAndNames(state);
+	AddVsharpAnnotationsAndNames(state);
+
+	if (state.subgroup_local_invocation_id_variable != 0) {
+		state.builder.DefineGlobalVariable(state.subgroup_local_invocation_id_variable,
+		                                   TypePointer(state, StorageClassInput, TypeU32(state)),
+		                                   StorageClassInput);
+	}
+	for (const auto& input: state.inputs) {
+		uint32_t ptr_type = TypePointer(state, StorageClassInput, TypeU32(state));
+		switch (input.kind) {
+			case IR::StageInputKind::VertexIndex:
+			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::Layer:
+			case IR::StageInputKind::SampleId:
+				ptr_type = TypePointer(state, StorageClassInput, TypeI32(state));
+				break;
+			case IR::StageInputKind::WorkgroupId:
+			case IR::StageInputKind::LocalInvocationId:
+			case IR::StageInputKind::GlobalInvocationId:
+				ptr_type = TypePointer(state, StorageClassInput, TypeU32Vector(state, 3));
+				break;
+			case IR::StageInputKind::FragCoord:
+				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 4));
+				break;
+			case IR::StageInputKind::BaryCoordSmooth:
+			case IR::StageInputKind::BaryCoordNoPerspective:
+				ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 3));
+				break;
+			case IR::StageInputKind::FrontFacing:
+				ptr_type = TypePointer(state, StorageClassInput, TypeBool(state));
+				break;
+			case IR::StageInputKind::Parameter:
+				if (state.stage == ShaderType::Vertex) {
+					const auto kind       = VertexParameterScalarKind(state, input.location);
+					const auto components = VertexParameterComponentCount(input);
+					ptr_type = VertexParameterInputPointerType(state, kind, components);
+				} else if (input.per_vertex) {
+					const auto array_type = state.builder.Type(
+					    OpTypeArray, {TypeF32Vector(state, 4), ConstantU32(state, 3)});
+					ptr_type = TypePointer(state, StorageClassInput, array_type);
+				} else {
+					ptr_type = TypePointer(state, StorageClassInput, TypeF32Vector(state, 4));
+				}
+				break;
+			default: break;
+		}
+		state.builder.DefineGlobalVariable(input.variable_id, ptr_type, StorageClassInput);
+	}
+	if (state.stage == ShaderType::Mesh) {
+		return;
+	}
+	if (state.per_vertex_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.per_vertex_variable, TypePointer(state, StorageClassOutput, PerVertexType(state)),
+		    StorageClassOutput);
+	}
+	if (state.point_size_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.point_size_variable, TypePointer(state, StorageClassOutput, TypeF32(state)),
+		    StorageClassOutput);
+	}
+	if (state.clip_distance_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.clip_distance_variable,
+		    TypePointer(state, StorageClassOutput,
+		                F32ArrayType(state, state.clip_distance_count)),
+		    StorageClassOutput);
+	}
+	if (state.cull_distance_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.cull_distance_variable,
+		    TypePointer(state, StorageClassOutput,
+		                F32ArrayType(state, state.cull_distance_count)),
+		    StorageClassOutput);
+	}
+	if (state.layer_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.layer_variable, TypePointer(state, StorageClassOutput, TypeU32(state)),
+		    StorageClassOutput);
+	}
+	if (state.viewport_index_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.viewport_index_variable, TypePointer(state, StorageClassOutput, TypeU32(state)),
+		    StorageClassOutput);
+	}
+	for (const auto& binding: state.outputs) {
+		if (binding.kind == IR::StageOutputKind::Parameter ||
+		    binding.kind == IR::StageOutputKind::Mrt) {
+			const auto pointer_type =
+			    binding.kind == IR::StageOutputKind::Mrt && MrtUsesUintOutput(state, binding.index)
+			        ? TypePointer(state, StorageClassOutput, TypeU32Vector(state, 4))
+			        : TypePointer(state, StorageClassOutput, TypeF32Vector(state, 4));
+			state.builder.DefineGlobalVariable(binding.variable_id, pointer_type,
+			                                   StorageClassOutput);
+		}
+	}
+	if (state.depth_variable != 0) {
+		state.builder.DefineGlobalVariable(state.depth_variable,
+		                                   TypePointer(state, StorageClassOutput, TypeF32(state)),
+		                                   StorageClassOutput);
+	}
+	if (state.sample_mask_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.sample_mask_variable,
+		    TypePointer(state, StorageClassOutput, SampleMaskArrayType(state)), StorageClassOutput);
 	}
 }
 

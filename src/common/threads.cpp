@@ -34,7 +34,7 @@ constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-static void SleepHighResolution100ns(uint64_t units_100ns) {
+static void SleepHighResolution100ns(uint64_t units_100ns, bool allow_spinning = true) {
 	if (units_100ns == 0) {
 		return;
 	}
@@ -42,7 +42,7 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 	// Keep spinning only where a kernel transition is
 	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
 	// per-thread high-resolution waitable timer below.
-	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
+	if (allow_spinning && units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
 		LARGE_INTEGER frequency {};
 		LARGE_INTEGER start {};
 		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&
@@ -133,7 +133,7 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 
 #ifdef KYTY_POSIX_HIGH_RES_SLEEP
 // Spin for very short waits; use an absolute deadline for longer waits.
-static void SleepHighResolutionNanos(uint64_t nanos) {
+static void SleepHighResolutionNanos(uint64_t nanos, bool allow_spinning = true) {
 	if (nanos == 0) {
 		return;
 	}
@@ -151,7 +151,7 @@ static void SleepHighResolutionNanos(uint64_t nanos) {
 	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
 	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
 
-	if (nanos <= SPIN_LIMIT_NS) {
+	if (allow_spinning && nanos <= SPIN_LIMIT_NS) {
 		timespec now {};
 		do {
 			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -305,6 +305,16 @@ void Thread::SleepNano(uint64_t nanos) {
 	SleepHighResolutionNanos(nanos);
 #else
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
+#endif
+}
+
+void Thread::SleepMicroWithoutSpinning(uint32_t micros) {
+#ifdef KYTY_WIN_CS
+	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10, false);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000, false);
+#else
+	std::this_thread::sleep_for(std::chrono::microseconds(micros));
 #endif
 }
 

@@ -66,7 +66,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::ShaderData:
+		case BindingKind::LodStats: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -149,8 +150,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if ((resource.atomic && adjustment % sizeof(uint32_t) != 0) ||
+	    adjustment >= 256 || size > max_range - adjustment) {
+		EXIT("storage buffer offset adjustment is unsupported: stage=%s slot=%u "
+		     "guest=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64
+		     " alignment=0x%" PRIx64 " adjustment=0x%" PRIx64 " max=0x%" PRIx64 "\n",
+		     ShaderStageResourceName(stage), slot, address, size, offset,
+		     static_cast<uint64_t>(alignment), adjustment, static_cast<uint64_t>(max_range));
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
@@ -850,6 +856,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
+	for (uint32_t i = 0; i < layout.lod_stats_count; ++i) {
+		const auto desc = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+		prepared.shader_data[layout.LodStatsDword() + i] = desc.MipStatsCntEn()
+		    ? (0x80000000u | desc.MipStatsCntId() | (uint32_t(desc.BaseLevel()) << 8u) |
+		       (uint32_t(desc.MinLodWarn5()) << 12u)) : 0u;
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -942,10 +954,7 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel) {
 		FindBuffers(*bindings.pixel);
 	}
-	if (bindings.vertex.runtime->program->info.uses_dma ||
-	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
-		m_context.PrepareBda();
-	}
+	PrepareBdaBindings(bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr);
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		RebindBuffers(*bindings.pixel);
@@ -957,12 +966,28 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	return bindings;
 }
 
+void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second) {
+	const bool first_dma = first.runtime->program->info.uses_dma;
+	const bool second_dma = second && second->runtime->program->info.uses_dma;
+	if (!first_dma && !second_dma) return;
+	std::vector<GuestRange> first_ranges, second_ranges;
+	const bool bounded = (!first_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
+	    first.runtime->program->bda_read_plan, first.runtime->resources, first_ranges)) &&
+	    (!second_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
+	    second->runtime->program->bda_read_plan, second->runtime->resources, second_ranges));
+	if (bounded) {
+		first_ranges.insert(first_ranges.end(), second_ranges.begin(), second_ranges.end());
+		if (m_context.GetGpuResources().PrepareBdaReadRanges(first_ranges)) return;
+	}
+	m_context.GetGpuResources().PrepareBda();
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
-                                    std::span<PreparedBindings* const> prepared_bindings) {
+                                    std::span<PreparedBindings* const> prepared_bindings, bool compute_chain) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
+	auto   vk_buffer        = compute_chain ? buffer.ChainHandle() : buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1093,6 +1118,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							m_descriptor_buffers.push_back(view);
 						}
 						break;
+					case BindingKind::LodStats: {
+						const auto* buffer = m_context.GetBufferCache().GetLodStatsBuffer();
+						m_descriptor_buffers.emplace_back(buffer->Handle(), 0, buffer->Size());
+						break;
+					}
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
 						auto&       cache      = m_context.GetBufferCache();

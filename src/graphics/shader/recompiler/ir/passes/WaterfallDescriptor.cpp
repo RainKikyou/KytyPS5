@@ -56,6 +56,10 @@ const Inst* MatchLowestSetBit(Value value, const Inst& mask_phi) {
 
 const Inst* MatchClearedMask(Value latch, const Inst& mask_phi) {
 	const auto* cleared = Match(latch, ValueOpcode::BitwiseXor32, 2);
+	const bool and_not = cleared == nullptr;
+	if (and_not) {
+		cleared = Match(latch, ValueOpcode::BitwiseAnd32, 2);
+	}
 	if (cleared == nullptr) {
 		return nullptr;
 	}
@@ -63,7 +67,17 @@ const Inst* MatchClearedMask(Value latch, const Inst& mask_phi) {
 		if (cleared->Arg(side).Resolve().TryInstruction() != &mask_phi) {
 			continue;
 		}
-		if (const auto* lsb = MatchLowestSetBit(cleared->Arg(1u - side), mask_phi)) {
+		auto bit = cleared->Arg(1u - side);
+		if (and_not) {
+			const auto* inverted = Match(bit, ValueOpcode::BitwiseNot32, 1);
+			if (inverted == nullptr) {
+				continue;
+			}
+			bit = inverted->Arg(0);
+		}
+		// Both mask ^ lowest_bit and mask & ~lowest_bit remove the
+		// selected bit. Require that it comes from this same mask Phi.
+		if (const auto* lsb = MatchLowestSetBit(bit, mask_phi)) {
 			return lsb;
 		}
 	}
@@ -143,6 +157,13 @@ const Inst* MatchTableOffset(const Inst& index, uint32_t& stride_shift, uint32_t
 		scaled_out   = scaled;
 		based        = use.user;
 		table_offset = immediate;
+	}
+	// Scalar loads can encode the table base in their memory immediate,
+	// leaving only the scaled index in the address expression.
+	if (based == nullptr) {
+		scaled_out = scaled;
+		table_offset = 0;
+		return scaled;
 	}
 	return based;
 }
@@ -330,6 +351,14 @@ std::vector<WaterfallDescriptor> FindWaterfallDescriptors(const Program& program
 				found.handle = MatchImageHandle(program, *based, found.heap);
 				if (found.handle == nullptr) {
 					break;
+				}
+				if (based == found.scaled) {
+					const auto* load = found.handle->Arg(0).Resolve().TryInstruction();
+					const auto memory_index = load->Flags<MemoryFlags>().index;
+					if (memory_index >= program.memory_info.size()) {
+						break;
+					}
+					found.table_offset = program.memory_info[memory_index].offset;
 				}
 				result.push_back(found);
 				break;

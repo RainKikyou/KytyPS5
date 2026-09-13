@@ -143,7 +143,7 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 			return &input;
 		}
 	}
-	if (state.program.stage != ShaderType::Pixel) {
+	if (state.stage != ShaderType::Pixel) {
 		return nullptr;
 	}
 	const auto mapped = ShaderPixelParameterMappedLocation(*state.input_info.pixel, location);

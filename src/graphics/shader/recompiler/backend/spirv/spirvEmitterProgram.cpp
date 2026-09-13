@@ -721,9 +721,8 @@ void EmitProgram(EmitterState& state) {
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
-		    spv::OpVariable,
-		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
-		    state.lds_variable, spv::StorageClassFunction);
+		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsStorageDwordCount(state)),
+		     state.lds_variable, StorageClassFunction});
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {

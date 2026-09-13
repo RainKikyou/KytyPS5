@@ -23,7 +23,17 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// Zero means untracked, disabled, invalid, or spanning several regions: do not cache.
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
+		if (!GuestRange{vaddr, size}.Valid() ||
+		    vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE) return 0;
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin,
+	                                               uint64_t size) noexcept;
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

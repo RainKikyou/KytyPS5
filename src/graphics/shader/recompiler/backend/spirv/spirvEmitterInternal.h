@@ -25,13 +25,317 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-struct InputBinding : IR::StageInput {
-	uint32_t variable_id = 0;
+enum : uint32_t {
+	ExecutionModelVertex                     = 0,
+	ExecutionModelFragment                   = 4,
+	ExecutionModelGLCompute                  = 5,
+	ExecutionModeOriginUpperLeft             = 7,
+	ExecutionModeEarlyFragmentTests          = 9,
+	ExecutionModeDepthReplacing              = 12,
+	ExecutionModeLocalSize                   = 17,
+	ExecutionModeSignedZeroInfNanPreserve    = 4461,
+	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
+	AddressingModelLogical                   = 0,
+	AddressingModelPhysicalStorageBuffer64   = 5348,
+	MemoryModelGLSL450                       = 1,
+	CapabilityShader                         = 1,
+	CapabilityInt64                          = 11,
+	CapabilityInt64Atomics                   = 12,
+	CapabilityImageGatherExtended            = 25,
+	CapabilityClipDistance                   = 32,
+	CapabilityCullDistance                   = 33,
+	CapabilitySampleRateShading              = 35,
+	CapabilitySampled1D                      = 43,
+	CapabilityImage1D                        = 44,
+	CapabilityImageQuery                     = 50,
+	CapabilityStorageImageWriteWithoutFormat = 56,
+	CapabilityGroupNonUniform                = 61,
+	CapabilityGroupNonUniformVote            = 62,
+	CapabilityGroupNonUniformArithmetic      = 63,
+	CapabilityGroupNonUniformBallot          = 64,
+	CapabilityGroupNonUniformShuffle         = 65,
+	CapabilityShaderLayer                    = 69,
+	CapabilityShaderViewportIndex            = 70,
+	CapabilitySignedZeroInfNanPreserve       = 4466,
+	CapabilityFragmentBarycentricKHR         = 5284,
+	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
+	CapabilityPhysicalStorageBufferAddresses = 5347,
+	StorageClassUniformConstant              = 0,
+	StorageClassInput                        = 1,
+	StorageClassOutput                       = 3,
+	StorageClassWorkgroup                    = 4,
+	StorageClassPrivate                      = 6,
+	StorageClassFunction                     = 7,
+	StorageClassPushConstant                 = 9,
+	StorageClassImage                        = 11,
+	StorageClassStorageBuffer                = 12,
+	StorageClassPhysicalStorageBuffer        = 5349,
+	FunctionControlNone                      = 0,
+	SelectionControlNone                     = 0,
+	LoopControlNone                          = 0,
 };
 
-struct OutputBinding : IR::StageOutput {
-	uint32_t variable_id        = 0;
-	uint32_t mesh_data_variable = 0;
+enum : uint32_t {
+	DecorationBlock         = 2,
+	DecorationBuiltIn       = 11,
+	DecorationNoPerspective = 13,
+	DecorationFlat          = 14,
+	DecorationAliased       = 20,
+	DecorationLocation      = 30,
+	DecorationArrayStride   = 6,
+	DecorationBinding       = 33,
+	DecorationDescriptorSet = 34,
+	DecorationOffset        = 35,
+	DecorationPerVertexKHR  = 5285,
+};
+
+enum : uint32_t {
+	BuiltInPosition                  = 0,
+	BuiltInPointSize                 = 1,
+	BuiltInClipDistance              = 3,
+	BuiltInCullDistance              = 4,
+	BuiltInLayer                     = 9,
+	BuiltInViewportIndex              = 10,
+	BuiltInFragCoord                 = 15,
+	BuiltInFrontFacing               = 17,
+	BuiltInSampleId                  = 18,
+	BuiltInSampleMask                = 20,
+	BuiltInFragDepth                 = 22,
+	BuiltInHelperInvocation          = 23,
+	BuiltInWorkgroupId               = 26,
+	BuiltInLocalInvocationId         = 27,
+	BuiltInGlobalInvocationId        = 28,
+	BuiltInLocalInvocationIndex      = 29,
+	BuiltInSubgroupLocalInvocationId = 41,
+	BuiltInVertexIndex               = 42,
+	BuiltInInstanceIndex             = 43,
+	BuiltInBaryCoordKHR              = 5286,
+	BuiltInBaryCoordNoPerspKHR       = 5287,
+};
+
+enum : uint32_t {
+	Dim1D              = 0,
+	Dim3D              = 2,
+	Dim2D              = 1,
+	ImageFormatUnknown = 0,
+	ImageFormatRgba32f = 1,
+	ImageFormatR32ui   = 33,
+};
+
+enum : uint32_t {
+	ImageOperandsBiasMask         = 0x00000001u,
+	ImageOperandsLodMask          = 0x00000002u,
+	ImageOperandsGradMask         = 0x00000004u,
+	ImageOperandsOffsetMask       = 0x00000010u,
+	ImageOperandsConstOffsetsMask = 0x00000020u,
+	ImageOperandsSampleMask       = 0x00000040u,
+};
+
+enum : uint32_t {
+	ScopeDevice                    = 1,
+	ScopeWorkgroup                 = 2,
+	ScopeSubgroup                  = 3,
+	MemorySemanticsNone            = 0,
+	MemorySemanticsAcquireRelease  = 0x00000008u,
+	MemorySemanticsUniformMemory   = 0x00000040u,
+	MemorySemanticsWorkgroupMemory = 0x00000100u,
+	MemorySemanticsImageMemory     = 0x00000800u,
+};
+
+enum : uint32_t {
+	OpExtInst                      = 12,
+	OpTypeVoid                     = 19,
+	OpTypeBool                     = 20,
+	OpTypeInt                      = 21,
+	OpTypeFloat                    = 22,
+	OpTypeVector                   = 23,
+	OpTypeImage                    = 25,
+	OpTypeSampler                  = 26,
+	OpTypeSampledImage             = 27,
+	OpTypeArray                    = 28,
+	OpTypeRuntimeArray             = 29,
+	OpTypeStruct                   = 30,
+	OpTypePointer                  = 32,
+	OpTypeFunction                 = 33,
+	OpConstantTrue                 = 41,
+	OpConstantFalse                = 42,
+	OpConstant                     = 43,
+	OpConstantComposite            = 44,
+	OpUndef                        = 1,
+	OpFunction                     = 54,
+	OpFunctionParameter            = 55,
+	OpFunctionEnd                  = 56,
+	OpFunctionCall                 = 57,
+	OpVariable                     = 59,
+	OpImageTexelPointer            = 60,
+	OpLoad                         = 61,
+	OpStore                        = 62,
+	OpAccessChain                  = 65,
+	OpArrayLength                  = 68,
+	OpDecorate                     = 71,
+	OpMemberDecorate               = 72,
+	OpVectorShuffle                = 79,
+	OpCompositeConstruct           = 80,
+	OpCompositeExtract             = 81,
+	OpCopyObject                   = 83,
+	OpSampledImage                 = 86,
+	OpImageSampleImplicitLod       = 87,
+	OpImageSampleExplicitLod       = 88,
+	OpImageSampleDrefImplicitLod   = 89,
+	OpImageSampleDrefExplicitLod   = 90,
+	OpImageFetch                   = 95,
+	OpImageGather                  = 96,
+	OpImageDrefGather              = 97,
+	OpImageWrite                   = 99,
+	OpImageQuerySizeLod            = 103,
+	OpImageQueryLod                = 105,
+	OpImageQuerySize               = 104,
+	OpImageQueryLevels             = 106,
+	OpConvertFToU                  = 109,
+	OpConvertFToS                  = 110,
+	OpConvertSToF                  = 111,
+	OpConvertUToF                  = 112,
+	OpUConvert                     = 113,
+	OpConvertUToPtr                = 120,
+	OpBitcast                      = 124,
+	OpSNegate                      = 126,
+	OpFNegate                      = 127,
+	OpIAdd                         = 128,
+	OpFAdd                         = 129,
+	OpISub                         = 130,
+	OpFSub                         = 131,
+	OpIMul                         = 132,
+	OpFMul                         = 133,
+	OpUDiv                         = 134,
+	OpUMod                         = 137,
+	OpFDiv                         = 136,
+	OpIAddCarry                    = 149,
+	OpUMulExtended                 = 151,
+	OpSMulExtended                 = 152,
+	OpAny                          = 154,
+	OpAll                          = 155,
+	OpIsNan                        = 156,
+	OpLogicalNotEqual              = 165,
+	OpLogicalOr                    = 166,
+	OpLogicalAnd                   = 167,
+	OpLogicalNot                   = 168,
+	OpSelect                       = 169,
+	OpIEqual                       = 170,
+	OpINotEqual                    = 171,
+	OpUGreaterThan                 = 172,
+	OpSGreaterThan                 = 173,
+	OpUGreaterThanEqual            = 174,
+	OpSGreaterThanEqual            = 175,
+	OpULessThan                    = 176,
+	OpSLessThan                    = 177,
+	OpULessThanEqual               = 178,
+	OpSLessThanEqual               = 179,
+	OpFOrdEqual                    = 180,
+	OpFUnordEqual                  = 181,
+	OpFOrdNotEqual                 = 182,
+	OpFUnordNotEqual               = 183,
+	OpFOrdLessThan                 = 184,
+	OpFUnordLessThan               = 185,
+	OpFOrdGreaterThan              = 186,
+	OpFUnordGreaterThan            = 187,
+	OpFOrdLessThanEqual            = 188,
+	OpFUnordLessThanEqual          = 189,
+	OpFOrdGreaterThanEqual         = 190,
+	OpFUnordGreaterThanEqual       = 191,
+	OpShiftRightLogical            = 194,
+	OpShiftRightArithmetic         = 195,
+	OpShiftLeftLogical             = 196,
+	OpBitwiseOr                    = 197,
+	OpBitwiseXor                   = 198,
+	OpBitwiseAnd                   = 199,
+	OpNot                          = 200,
+	OpBitFieldInsert               = 201,
+	OpBitFieldSExtract             = 202,
+	OpBitFieldUExtract             = 203,
+	OpBitReverse                   = 204,
+	OpBitCount                     = 205,
+	OpControlBarrier               = 224,
+	OpMemoryBarrier                = 225,
+	OpAtomicLoad                   = 227,
+	OpAtomicExchange               = 229,
+	OpAtomicCompareExchange        = 230,
+	OpAtomicIAdd                   = 234,
+	OpAtomicISub                   = 235,
+	OpAtomicSMin                   = 236,
+	OpAtomicUMin                   = 237,
+	OpAtomicSMax                   = 238,
+	OpAtomicUMax                   = 239,
+	OpAtomicAnd                    = 240,
+	OpAtomicOr                     = 241,
+	OpAtomicXor                    = 242,
+	OpPhi                          = 245,
+	OpLoopMerge                    = 246,
+	OpSelectionMerge               = 247,
+	OpLabel                        = 248,
+	OpBranch                       = 249,
+	OpBranchConditional            = 250,
+	OpSwitch                       = 251,
+	OpKill                         = 252,
+	OpReturn                       = 253,
+	OpReturnValue                  = 254,
+	OpGroupNonUniformElect         = 333,
+	OpGroupNonUniformAllEqual      = 336,
+	OpGroupNonUniformIAdd          = 349,
+	OpGroupNonUniformUMin          = 354,
+	OpGroupNonUniformBallot        = 339,
+	OpGroupNonUniformBallotFindLSB = 343,
+	OpGroupNonUniformShuffle       = 345,
+};
+
+enum : uint32_t {
+	MemoryAccessAlignedMask = 0x2,
+};
+
+enum : uint32_t {
+	GlslRoundEven       = 2,
+	GlslTrunc           = 3,
+	GlslFAbs            = 4,
+	GlslFloor           = 8,
+	GlslCeil            = 9,
+	GlslFract           = 10,
+	GlslSin             = 13,
+	GlslCos             = 14,
+	GlslExp2            = 29,
+	GlslLog2            = 30,
+	GlslSqrt            = 31,
+	GlslInverseSqrt     = 32,
+	GlslFMin            = 37,
+	GlslUMin            = 38,
+	GlslFMax            = 40,
+	GlslFClamp          = 43,
+	GlslSClamp          = 45,
+	GlslLdexp           = 53,
+	GlslFma             = 50,
+	GlslPackSnorm2x16   = 56,
+	GlslPackUnorm2x16   = 57,
+	GlslPackHalf2x16    = 58,
+	GlslUnpackUnorm2x16 = 61,
+	GlslUnpackHalf2x16  = 62,
+	GlslFindILsb        = 73,
+	GlslFindUMsb        = 75,
+};
+
+struct InputBinding {
+	IR::StageInputKind kind            = IR::StageInputKind::VertexIndex;
+	uint32_t           location        = 0;
+	uint32_t           component_count = 1;
+	uint32_t           variable_id     = 0;
+	std::string        debug_name;
+	bool               per_vertex = false;
+};
+
+struct OutputBinding {
+	IR::StageOutputKind kind        = IR::StageOutputKind::Parameter;
+	uint32_t            index       = 0;
+	uint32_t            location    = 0;
+	uint32_t            variable_id = 0;
+	std::string         debug_name;
+	uint32_t            mesh_data_variable = 0;
 };
 
 using ImageDimension = Decoder::ImageDimension;
@@ -90,11 +394,17 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         lod_stats_variable      = 0;
+	bool                                             lod_stats_subgroup      = false;
+	uint32_t                                         lod_helper_variable     = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         compact_lds_dwords      = 0;
+	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
+	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -361,6 +671,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+uint32_t LdsStorageDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind kind             = IR::ResourceKind::None;

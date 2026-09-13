@@ -8,6 +8,117 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+// Experimental PS5 feedback path. The report packing is inferred from the game's
+// consumer; only implicit-LOD 2D pixel samples are instrumented for now.
+void EmitLodStats(EmitterState& state, uint32_t resource, uint32_t sampled,
+                  uint32_t coordinate, uint32_t bias) {
+	if (state.lod_stats_variable == 0) return;
+	const auto metadata = EmitShaderDataDwordLoad(state, state.program.bindings.LodStatsDword() + resource);
+	const auto enabled = state.builder.AllocateId();
+	state.builder.AddFunction({OpINotEqual, TypeBool(state), enabled,
+	    EmitBinaryU32(state, OpBitwiseAnd, metadata, ConstantU32(state, 0x80000000u)), ConstantU32(state, 0)});
+	// Keep the derivative query outside the enable branch. Vulkan's second
+	// component is unclamped, relative to the image view's base mip.
+	const auto query = state.builder.AllocateId();
+	state.builder.AddFunction({OpImageQueryLod, TypeF32Vector(state, 2), query, sampled, coordinate});
+	auto lod = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), lod, query, 1});
+	if (bias != 0) {
+		const auto sum = state.builder.AllocateId();
+		state.builder.AddFunction({OpFAdd, TypeF32(state), sum, lod, bias});
+		lod = sum;
+	}
+	const auto base = EmitBinaryU32(state, OpBitwiseAnd,
+	    EmitBinaryU32(state, OpShiftRightLogical, metadata, ConstantU32(state, 8)), ConstantU32(state, 15));
+	const auto base_f = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertUToF, TypeF32(state), base_f, base});
+	const auto absolute = state.builder.AllocateId();
+	state.builder.AddFunction({OpFAdd, TypeF32(state), absolute, lod, base_f});
+	const auto isnan = state.builder.AllocateId();
+	state.builder.AddFunction({OpIsNan, TypeBool(state), isnan, absolute});
+	const auto finite = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeF32(state), finite, isnan, ConstantF32Value(state, 15), absolute});
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction({OpExtInst, TypeF32(state), clamped, GlslStd450(state), GlslFClamp,
+	    finite, ConstantF32Value(state, 0), ConstantF32Value(state, 15)});
+	const auto mip = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertFToU, TypeU32(state), mip, clamped});
+	auto active = enabled;
+	if (state.pixel_valid_mask_variable != 0) {
+		const auto mask = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeU32(state), mask, state.pixel_valid_mask_variable});
+		const auto valid = state.builder.AllocateId();
+		state.builder.AddFunction({OpINotEqual, TypeBool(state), valid, mask, ConstantU32(state, 0)});
+		active = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalAnd, TypeBool(state), active, enabled, valid});
+	}
+	if (state.lod_helper_variable != 0) {
+		const auto helper = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeBool(state), helper, state.lod_helper_variable});
+		const auto real = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalNot, TypeBool(state), real, helper});
+		const auto real_active = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalAnd, TypeBool(state), real_active, active, real});
+		active = real_active;
+	}
+	EmitIfCondition(state, active, [&] {
+		const auto counter = EmitBinaryU32(state, OpShiftLeftLogical,
+		    EmitBinaryU32(state, OpBitwiseAnd, metadata, ConstantU32(state, 255)), ConstantU32(state, 2));
+		const auto atomic = [&](uint32_t offset, uint32_t opcode, uint32_t value) {
+			const auto ptr = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), ptr,
+			    state.lod_stats_variable, ConstantU32(state, 0), EmitAddU32(state, counter, ConstantU32(state, offset))});
+			state.builder.AddFunction({opcode, TypeU32(state), state.builder.AllocateId(), ptr,
+			    ConstantU32(state, ScopeDevice), ConstantU32(state, MemorySemanticsNone), value});
+		};
+
+		const auto threshold = EmitBinaryU32(state, OpBitwiseAnd,
+		    EmitBinaryU32(state, OpShiftRightLogical, metadata, ConstantU32(state, 12)), ConstantU32(state, 4095));
+		const auto threshold_f = state.builder.AllocateId();
+		state.builder.AddFunction({OpConvertUToF, TypeF32(state), threshold_f, threshold});
+		const auto scaled = state.builder.AllocateId();
+		state.builder.AddFunction({OpFMul, TypeF32(state), scaled, clamped, ConstantF32Value(state, 256)});
+		const auto warn = state.builder.AllocateId();
+		state.builder.AddFunction({OpFOrdLessThan, TypeBool(state), warn, scaled, threshold_f});
+		const auto increment = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, TypeU32(state), increment, warn, ConstantU32(state, 1), ConstantU32(state, 0)});
+		auto output_mip = mip;
+		auto output_count = ConstantU32(state, 1);
+		auto output_warn = increment;
+		auto write = ConstantBool(state, true);
+		if (state.lod_stats_subgroup) {
+			const auto scope = ConstantU32(state, ScopeSubgroup);
+			const auto same_counter = state.builder.AllocateId();
+			state.builder.AddFunction({OpGroupNonUniformAllEqual, TypeBool(state), same_counter, scope, counter});
+			const auto reduce = [&](uint32_t op, uint32_t value) {
+				const auto id = state.builder.AllocateId();
+				state.builder.AddFunction({op, TypeU32(state), id, scope, 0, value});
+				return id;
+			};
+			const auto select = [&](uint32_t grouped, uint32_t single) {
+				const auto id = state.builder.AllocateId();
+				state.builder.AddFunction({OpSelect, TypeU32(state), id, same_counter, grouped, single});
+				return id;
+			};
+			output_mip = select(reduce(OpGroupNonUniformUMin, mip), mip);
+			output_count = select(reduce(OpGroupNonUniformIAdd, output_count), output_count);
+			output_warn = select(reduce(OpGroupNonUniformIAdd, increment), increment);
+			const auto elected = state.builder.AllocateId();
+			state.builder.AddFunction({OpGroupNonUniformElect, TypeBool(state), elected, scope});
+			write = state.builder.AllocateId();
+			// Different counters in a subgroup fall back to independent lane writes.
+			state.builder.AddFunction({OpSelect, TypeBool(state), write, same_counter, elected, ConstantBool(state, true)});
+		}
+		const auto publish = [&] {
+			atomic(0, OpAtomicUMin, output_mip);
+			atomic(1, OpAtomicIAdd, output_count);
+			atomic(2, OpAtomicIAdd, output_warn);
+		};
+		if (state.lod_stats_subgroup) EmitIfCondition(state, write, publish);
+		else publish();
+	});
+}
+
 uint32_t DmaskComponentIndex(uint32_t dmask, uint32_t component) {
 	uint32_t index = 0;
 	for (uint32_t i = 0; i < component; i++) {
@@ -753,7 +864,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands.push_back(operand_mask);
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
 			}
-			state.builder.AddFunction(opcode, sample_operands);
+			state.builder.AddFunction(words);
+			if (!explicit_lod && (dimension == ImageDimension::Dim2D || dimension == ImageDimension::Dim2DArray)) {
+				const auto stats_coord = CoordF32(ctx, mem, *address, layout.coord, 2);
+				const auto bias = layout.bias != NoImageComponent ? AddressF32(ctx, mem, *address, layout.bias) : 0u;
+				EmitLodStats(state, resource, sampled, stats_coord, bias);
+			}
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {
@@ -845,13 +961,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
 		EmitLabel(state, default_label);
 		phi_words.push_back(EmitSample(image.indirect_resources[0]));
-		phi_words.push_back(default_label);
-		state.builder.AddFunction(spv::OpBranch, merge_label);
+		phi_words.push_back(state.current_label);
+		state.builder.AddFunction({OpBranch, merge_label});
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
 			EmitLabel(state, labels[candidate - 1u]);
 			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
-			phi_words.push_back(labels[candidate - 1u]);
-			state.builder.AddFunction(spv::OpBranch, merge_label);
+			phi_words.push_back(state.current_label);
+			state.builder.AddFunction({OpBranch, merge_label});
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);

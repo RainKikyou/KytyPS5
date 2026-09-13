@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
@@ -24,6 +25,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -106,6 +108,21 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
+bool ReadShaderRawGuestMemory(void*, uint64_t address, uint32_t* value) {
+	// A GPU-written neighbour may protect a clean descriptor on the same page.
+	// Reading its checked backing alias avoids an unnecessary GPU drain. Dirty,
+	// unmapped and untracked addresses retain the original load/fault behavior.
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, value,
+	                                                                  sizeof(*value)))
+		std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	return true;
+}
+
+bool ReadShaderMemorySpan(void*, uint64_t address, uint32_t* values, uint32_t count, bool clean) {
+	return count >= 2 && count <= 16 &&
+	       Libs::LibKernel::Memory::TryReadGpuShaderSpan(address, values, count * 4u, clean);
+}
+
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
@@ -184,6 +201,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	if (tools.Validate(spirv)) {
 		return true;
 	}
+	// Fatal validation diagnostics must survive silent shader/printf settings.
+	std::fprintf(stderr, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
+	             label, shader_hash, messages.c_str());
+	std::fflush(stderr);
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
 	std::string          text;
 	disassembler.Disassemble(spirv, &text,
@@ -219,12 +240,12 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
-		std::vector<Permutation>           permutations;
+		// ShaderStageRuntime keeps a pointer into a compiled permutation. Later
+		// specializations of the same source must not invalidate an earlier draw.
+		std::deque<Permutation> permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -317,12 +338,16 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
-		    .user_data                  = params.user_data,
-		    .shader_base                = params.Base(),
-		    .read_specialization_memory = ReadShaderGuestMemory,
-		    .sync_memory                = SyncShaderGuestMemory,
-		};
+		const ShaderRecompiler::IR::SrtRuntime       input_runtime {
+		          .user_data                  = params.user_data,
+		          .shader_base                = params.Base(),
+		          .read_memory                = ReadShaderRawGuestMemory,
+		          .read_specialization_memory = ReadShaderGuestMemory,
+		          .sync_memory                = SyncShaderGuestMemory,
+		          .try_read_memory_span       = ReadShaderMemorySpan,
+        };
+		ShaderReadObserver::Runtime observed_runtime(input_runtime);
+		const auto& runtime = observed_runtime.Get();
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
 			ReportMaterialization(label, stage, params.hash, report,
@@ -355,6 +380,7 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
+		options.enable_lod_stats = true;
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
 		options.back_code      = params.back_code;
@@ -633,6 +659,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
+		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);

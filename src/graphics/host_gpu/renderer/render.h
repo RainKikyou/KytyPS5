@@ -114,6 +114,13 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Only the dispatch path can bypass a pending dependency, after preparing
+	// resources. Every other host command drains it through Handle().
+	[[nodiscard]] vk::CommandBuffer ChainHandle() const;
+	[[nodiscard]] bool ComputeChainPending() const noexcept { return m_compute_access_pending; }
+	void ContinueComputeChain() const;
+	[[nodiscard]] vk::CommandBuffer HandleForFullBarrier() const;
+
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -133,6 +140,7 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
+	mutable bool       m_compute_access_pending = false;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
@@ -161,13 +169,16 @@ public:
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
+	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings);
+	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);
 
 private:
+	bool TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer, std::span<const DrawIndexArgs> draws,
+	                     std::span<const uint64_t> argument_addresses);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
@@ -189,8 +200,8 @@ private:
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          DrawRenderState& state);
-	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                          bool log_setup_phases, DrawRenderState& state);
+	bool ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);

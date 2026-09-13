@@ -69,7 +69,7 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool enable_lod_stats) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
@@ -79,6 +79,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	if (enable_lod_stats && program.stage == ShaderType::Pixel && !program.info.images.empty()) {
+		next.lod_stats_count = static_cast<uint32_t>(program.info.images.size());
+		AddBinding(next, DescriptorBindingKind::LodStats);
+	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

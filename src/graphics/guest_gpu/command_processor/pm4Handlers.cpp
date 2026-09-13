@@ -21,6 +21,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -1306,6 +1307,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	cp.BreakComputeChain();
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -1331,29 +1333,8 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		struct DispatchIndirectArgs {
-			uint32_t thread_group_x;
-			uint32_t thread_group_y;
-			uint32_t thread_group_z;
-		};
-
 		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
-		uint32_t   mode      = buffer[2];
-
-		EXIT_NOT_IMPLEMENTED(args_addr == 0);
-		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
-			static std::atomic<uint32_t> sync_fallback_logs {0};
-			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
-				     " (image-owned range, reading guest memory)\n",
-				     args_addr);
-			}
-		}
-		DispatchIndirectArgs args {};
-		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
-		cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode,
-		                  args_addr);
-
+		cp.DispatchIndirectAddress(args_addr, buffer[2]);
 		return 3;
 	}
 
@@ -1375,12 +1356,17 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
+		if (buffer_size == 0x840) {
+			cp.ReportLodStats(dst, buffer_size, (buffer[3] & ((1u << 19) | (1u << 18))) != 0);
+			return 4;
+		}
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+
 	}
 
 	return 4;

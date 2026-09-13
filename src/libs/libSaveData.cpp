@@ -9,6 +9,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
+#include "libs/saveDataCapacity.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
@@ -25,7 +26,7 @@ namespace SaveData {
 
 // TODO(): specify dir at launcher
 static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
-static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
+
 
 struct SceSaveDataDirName {
 	char data[32];
@@ -294,6 +295,12 @@ static bool dir_name_match(const char* str, const char* pattern) {
 	return *str == '\0' && *pattern == '\0';
 }
 
+static std::filesystem::path capacity_metadata(std::string_view name) {
+	// Keep emulator bookkeeping outside guest-visible save directories.
+	return std::filesystem::path(SAVE_DATA_DIR) / ".kyty-capacity" / get_title_id() /
+	       (std::string(name) + ".blocks");
+}
+
 static int mount_save_data(int slot, std::string_view dir_name, const std::string& directory,
                            uint32_t status, SaveDataMountResult* result) {
 	const std::string mount_point = SaveDataMountSlots::MountPoint(static_cast<size_t>(slot));
@@ -412,8 +419,11 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		}
 		if (result->infos != nullptr) {
 			result->infos[i]             = {};
-			result->infos[i].blocks      = SAVE_DATA_BLOCKS_MAX;
-			result->infos[i].free_blocks = SAVE_DATA_BLOCKS_MAX;
+			const auto capacity = ReadSaveDataCapacity(std::filesystem::path(root) / dir_list[i],
+			                                               capacity_metadata(dir_list[i]));
+			if (!capacity) { return SAVE_DATA_ERROR_INTERNAL; }
+			result->infos[i].blocks = capacity->blocks;
+			result->infos[i].free_blocks = capacity->free_blocks;
 		}
 	}
 
@@ -472,6 +482,12 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		created = true;
 
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
+	}
+
+	const auto metadata = capacity_metadata(dir_name);
+	const auto capacity = ReadSaveDataCapacity(mount_dir, metadata);
+	if (!capacity || !WriteSaveDataCapacity(metadata, std::max(capacity->blocks, mount->blocks))) {
+		return SAVE_DATA_ERROR_INTERNAL;
 	}
 
 	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
@@ -692,6 +708,9 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + std::string(del->dir_name->data);
 	if (Common::File::IsDirectoryExisting(dir)) {
 		Common::File::DeleteDirectory(dir);
+		std::error_code ec;
+		std::filesystem::remove(capacity_metadata(del->dir_name->data), ec);
+		if (ec) { return SAVE_DATA_ERROR_INTERNAL; }
 	}
 
 	return OK;
@@ -853,8 +872,15 @@ int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
 
 	*info = {};
 
-	info->blocks      = SAVE_DATA_BLOCKS_MAX;
-	info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+	Common::LockGuard lock(g_mount_mutex);
+	const int slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) { return SAVE_DATA_ERROR_NOT_MOUNTED; }
+	const auto& name = g_mount_slots.Directory(static_cast<size_t>(slot));
+	const auto capacity = ReadSaveDataCapacity(
+	    std::filesystem::path(SAVE_DATA_DIR) / get_title_id() / name, capacity_metadata(name));
+	if (!capacity) { return SAVE_DATA_ERROR_INTERNAL; }
+	info->blocks = capacity->blocks;
+	info->free_blocks = capacity->free_blocks;
 
 	return OK;
 }

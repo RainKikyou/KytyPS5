@@ -53,6 +53,8 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	m_sync_buffers_valid = false;
+	++m_registration_epoch;
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -174,10 +176,43 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
+	// Pack the 64-byte completion header and 256 eight-byte LOD counters.
+	// The command processor keeps other packet layouts on the existing path.
+	EXIT_IF(dst == nullptr || size != 0x840);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = m_lod_stats_buffer.Handle();
+	barrier.size = 256 * 16;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	    vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	m_scheduler.Finish();
+	m_lod_stats_buffer.Invalidate(0, 256 * 16);
+	auto* words = reinterpret_cast<uint32_t*>(m_lod_stats_buffer.Mapped().data());
+	std::memset(dst, 0, size);
+	const uint32_t ready = 1;
+	std::memcpy(dst, &ready, sizeof(ready));
+	for (uint32_t i = 0; i < 256; ++i) {
+		const uint64_t entry = (uint64_t(words[i * 4] & 15u) << 56u) |
+		    (uint64_t(std::min(words[i * 4 + 1], 0xffffffu)) << 32u) | words[i * 4 + 1];
+		std::memcpy(static_cast<uint8_t*>(dst) + 64 + i * 8, &entry, sizeof(entry));
+		if (reset) {
+			words[i * 4] = 15;
+			words[i * 4 + 1] = words[i * 4 + 2] = words[i * 4 + 3] = 0;
+		}
+	}
+	if (reset) m_lod_stats_buffer.Flush(0, 256 * 16);
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
+      m_lod_stats_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, 256 * 16),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
@@ -188,6 +223,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	std::memset(m_lod_stats_buffer.Mapped().data(), 0, 256 * 16);
+	for (uint32_t i = 0; i < 256; ++i) {
+		reinterpret_cast<uint32_t*>(m_lod_stats_buffer.Mapped().data())[i * 4] = 15;
+	}
+	m_lod_stats_buffer.Flush(0, 256 * 16);
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
@@ -362,6 +402,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (!is_written && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		// CPU cleanliness does not prove that an aliased image is current.
+		return is_texel_buffer && SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	if (is_written && m_memory_tracker.IsRegionFullyGpuModified(vaddr, size)) {
+		// ObtainBuffer still records the exact write range and invalidates its epoch.
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -434,6 +482,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
+	const auto id     = FindBuffer(vaddr, size);
+	auto&      buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -446,7 +501,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
-		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
@@ -636,20 +691,73 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
-	if (it != m_buffers.begin()) {
-		--it;
+void BufferCache::CollectMappedRegisteredRanges(const RangeSet& mapped,
+                                                std::vector<RangeSet::Range>& ranges) const {
+	ranges.clear();
+	for (const auto& [address, id] : m_buffers) {
+		mapped.ForEachIntersection(address, m_slot_buffers[id].Size(), [&](RangeSet::Range range) {
+			if (!ranges.empty() && ranges.back().address + ranges.back().size == range.address)
+				ranges.back().size += range.size;
+			else ranges.push_back(range);
+		});
 	}
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		auto&      buffer = m_slot_buffers[it->second];
-		const auto start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+}
+
+void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+	const auto epoch = m_memory_tracker.CpuModificationEpoch(request.address, request.size);
+	const auto registered = m_registration_epoch;
+	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered)
+		return;
+	SynchronizeBuffersInRange(request.address, request.size);
+	request.cpu_epoch = 0;
+	if (epoch != 0 && m_registration_epoch == registered &&
+	    m_memory_tracker.CpuModificationEpoch(request.address, request.size) == epoch) {
+		request.cpu_epoch = epoch;
+		request.registration_epoch = registered;
+	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	if (!m_sync_buffers_valid) {
+		m_sync_buffers.clear();
+		m_sync_buffers.reserve(m_buffers.size());
+		for (const auto& [address, id]: m_buffers) {
+			auto& buffer = m_slot_buffers[id];
+			const auto end = address + buffer.Size();
+			for (auto start = address; start < end;) {
+				const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+				m_sync_buffers.push_back({start, finish, &buffer});
+				start = finish;
+			}
+		}
+		m_sync_stamps.assign(m_sync_buffers.size(), {});
+		m_sync_buffers_valid = true;
+	}
+	const auto end = vaddr + size;
+
+	auto it = std::lower_bound(m_sync_buffers.begin(), m_sync_buffers.end(), vaddr,
+	                           [](const SyncBuffer& buffer, uint64_t address) {
+		                           return buffer.end <= address;
+	                           });
+	for (; it != m_sync_buffers.end() && it->start < end; ++it) {
+		const auto start  = std::max(it->start, vaddr);
+		const auto finish = std::min(it->end, end);
 		if (start < finish) {
-			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			SyncStamp* stamp = nullptr;
+			uint64_t epoch = 0;
+			{
+				stamp = &m_sync_stamps[static_cast<size_t>(it - m_sync_buffers.begin())];
+				epoch = m_memory_tracker.CpuModificationEpoch(start, finish - start);
+				if (epoch != 0 && stamp->epoch == epoch && start >= stamp->begin && finish <= stamp->end) continue;
+			}
+			(void)SynchronizeBuffer(*it->buffer, start, finish - start, false, false);
+			if (stamp != nullptr && epoch != 0 && m_sync_buffers_valid &&
+			    m_memory_tracker.CpuModificationEpoch(start, finish - start) == epoch) {
+				*stamp = {start, finish, epoch};
+			}
 		}
 	}
+
 }
 
 } // namespace Libs::Graphics

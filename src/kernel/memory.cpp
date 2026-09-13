@@ -215,6 +215,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -245,6 +246,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -276,6 +278,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -290,6 +293,7 @@ public:
 	bool ConsumeReserved(uint64_t start, uint64_t size,
 	                     VirtualRangeType type = VirtualRangeType::Reserved) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		auto end = End(start, size);
 		for (const auto& r: m_ranges) {
@@ -306,6 +310,7 @@ public:
 	bool ConsumeReservedSpan(uint64_t start, uint64_t size, Range* first_range = nullptr,
 	                         VirtualRangeType type = VirtualRangeType::Reserved) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		if (size == 0) {
 			return false;
@@ -337,6 +342,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -349,12 +355,14 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
+		Mutation          mutation(*this);
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -420,11 +428,24 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+		struct CachedRange {
+			uint64_t identity = 0, epoch = 0, begin = 0, end = 0;
+		};
+		thread_local std::array<CachedRange, 128> cache;
+		auto& entry = cache[((virtual_addr >> 18) ^ (virtual_addr >> 30)) & 127];
+		{
+			const auto epoch = m_epoch.load(std::memory_order_acquire);
+			// Only fully contained committed requests can bypass the lookup.
+			// Clamped/invalid requests still use the original locked walk.
+			if (!(epoch & 1) && entry.identity == m_identity && entry.epoch == epoch &&
+			    virtual_addr >= entry.begin && virtual_addr < entry.end &&
+			    size <= entry.end - virtual_addr)
+				return size;
+		}
+		Common::LockGuard lock(m_mutex);
 
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
@@ -440,18 +461,22 @@ public:
 			return 0;
 		}
 
+		const auto cache_begin  = vma->start;
+		auto       cache_end    = vma_end;
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
 		++vma;
 
 		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
 		       clamped_size < size) {
+			cache_end        = End(vma->start, vma->size);
 			const auto chunk = std::min(size - clamped_size, vma->size);
 			clamped_size += chunk;
 			expected += chunk;
 			++vma;
 		}
 
+		entry = {m_identity, m_epoch.load(std::memory_order_relaxed), cache_begin, cache_end};
 		return clamped_size;
 	}
 
@@ -481,6 +506,19 @@ public:
 	}
 
 private:
+	// Writers already hold m_mutex. Odd epochs make concurrent cache readers
+	// take that lock; the final release invalidates every previous interval.
+	struct Mutation {
+		VirtualRanges& owner;
+		explicit Mutation(VirtualRanges& ranges): owner(ranges) {
+			owner.m_epoch.fetch_add(1, std::memory_order_acq_rel);
+		}
+		~Mutation() { owner.m_epoch.fetch_add(1, std::memory_order_release); }
+	};
+	inline static std::atomic<uint64_t> s_next_identity {1};
+	const uint64_t        m_identity = s_next_identity.fetch_add(1, std::memory_order_relaxed);
+	std::atomic<uint64_t> m_epoch {2};
+
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
 	}
@@ -878,6 +916,27 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRange(vaddr, size);
+}
+
+bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	       IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
+	       TryReadGpuCleanBacking(vaddr, data, size);
+}
+
+bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean) {
+	if (!data || size < 8 || size > 64 || !g_gpu_resources || !Graphics::GuestGpu::IsGpuThread() ||
+	    !IsGpuAddressRange(vaddr, size))
+		return false;
+	if (!clean && !g_gpu_resources->HasReadWatchers(vaddr, size)) {
+		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
+		return true;
+	}
+	return TryReadGpuCleanBacking(vaddr, data, size);
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
@@ -924,7 +983,12 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
-void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
+bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->InvalidateMemory(vaddr, size);
+}
+
+void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
 }

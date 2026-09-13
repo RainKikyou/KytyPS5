@@ -29,6 +29,14 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Backing aliases bypass guest page protection. Invalidate hoisted preparation
+// across every such write and mapping/protection mutation on every host OS.
+struct GuestBackingMutation {
+	Graphics::GpuResourceManager* resources = g_gpu_resources;
+	GuestBackingMutation() { if (resources) resources->BeginAliasWrite(); }
+	~GuestBackingMutation() { if (resources) resources->EndAliasWrite(); }
+};
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -159,6 +167,7 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
+		GuestBackingMutation mutation;
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
@@ -167,6 +176,7 @@ public:
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		GuestBackingMutation mutation;
 		if (data == nullptr) {
 			return false;
 		}
@@ -228,6 +238,7 @@ public:
 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                                 VirtualMemory::Mode mode,
 	                                 FailureReason*      failure_reason = nullptr) {
+		GuestBackingMutation mutation;
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			SetFailure(failure_reason, !IsAvailable() ? FailureReason::BackingUnavailable
 			                                          : FailureReason::PhysicalRangeOutOfBounds);
@@ -246,6 +257,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_alias_ranges_valid = false;
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -257,6 +269,7 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
+			m_alias_ranges_valid = false;
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -328,6 +341,7 @@ public:
 	}
 
 	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
+		GuestBackingMutation mutation;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
 			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
@@ -346,6 +360,7 @@ public:
 				auto entry = std::prev(next);
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
+					m_alias_ranges_valid = false;
 					m_maps.erase(entry);
 				}
 			}
@@ -361,6 +376,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_alias_ranges_valid = false;
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -415,11 +431,13 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_alias_ranges_valid = false;
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			std::lock_guard lock(m_mutex);
+			m_alias_ranges_valid = false;
 			m_maps.emplace(old.vaddr, old);
 			return false;
 		}
@@ -476,6 +494,50 @@ public:
 		}
 
 		return true;
+	}
+
+	bool IsUniqueRange(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		return IsUniqueRangeUnlocked(vaddr, size);
+	}
+
+private:
+	bool IsUniqueRangeUnlocked(uint64_t vaddr, uint64_t size) {
+		MapEntry owner {};
+		if (!FindContainingUnlocked(vaddr, size, &owner)) return false;
+		if (!m_alias_ranges_valid) {
+			// Build physical intervals shared by at least two guest mappings.
+			// An alias elsewhere in a large allocation does not affect this range.
+			std::vector<std::pair<uint64_t, int>> endpoints;
+			endpoints.reserve(m_maps.size() * 2);
+			for (const auto& [_, entry] : m_maps) {
+				endpoints.emplace_back(entry.backing_offset, 1);
+				endpoints.emplace_back(entry.backing_offset + entry.size, -1);
+			}
+			std::sort(endpoints.begin(), endpoints.end());
+			m_aliased_physical_ranges.clear();
+			uint64_t previous = 0;
+			int active = 0;
+			for (size_t i = 0; i < endpoints.size();) {
+				const auto position = endpoints[i].first;
+				if (active > 1 && previous < position) {
+					if (!m_aliased_physical_ranges.empty() &&
+					    m_aliased_physical_ranges.back().second == previous)
+						m_aliased_physical_ranges.back().second = position;
+					else m_aliased_physical_ranges.emplace_back(previous, position);
+				}
+				do { active += endpoints[i++].second; }
+				while (i < endpoints.size() && endpoints[i].first == position);
+				previous = position;
+			}
+			EXIT_IF(active != 0);
+			m_alias_ranges_valid = true;
+		}
+		const auto physical = owner.backing_offset + vaddr - owner.vaddr;
+		const auto found = std::lower_bound(m_aliased_physical_ranges.begin(),
+		    m_aliased_physical_ranges.end(), physical,
+		    [](const auto& interval, uint64_t value) { return interval.second <= value; });
+		return found == m_aliased_physical_ranges.end() || physical + size <= found->first;
 	}
 
 private:
@@ -646,6 +708,8 @@ private:
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>> m_aliased_physical_ranges;
+	bool m_alias_ranges_valid = false;
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
@@ -744,9 +808,12 @@ public:
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
+	bool IsUniqueBackingRange(uint64_t vaddr, uint64_t size) { return m_backing->IsUniqueRange(vaddr, size); }
+
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		GuestBackingMutation mutation;
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}

@@ -342,6 +342,11 @@ void TestRegionMaskWatcherRanges() {
 
   g_protection_calls = 0;
   manager.UpdatePageWatchersForRegion<true, true>(region_base, sparse_mask);
+  Check(manager.HasReadWatchers(region_base + page_size + 3, 4) &&
+	        manager.HasReadWatchers(region_base + page_size - 1, 2) &&
+	        !manager.HasReadWatchers(region_base + page_size * 2, page_size) &&
+	        !manager.HasReadWatchers(region_base, 0) && !manager.HasReadWatchers(UINT64_MAX - 2, 8),
+	    "read hints lost page rounding, sparse gaps or invalid range checks");
   Check(g_protection_calls == 2 &&
             Protection(reinterpret_cast<void *>(region_base + page_size)) ==
                 PAGE_NOACCESS &&
@@ -351,6 +356,7 @@ void TestRegionMaskWatcherRanges() {
   g_protection_calls = 0;
   g_protection_ranges.clear();
   manager.UpdatePageWatchersForRegion<false, true>(region_base, sparse_mask);
+  Check(!manager.HasReadWatchers(region_base, region_size), "read unwatch retained stale hints");
   Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
             g_protection_ranges[0].size == page_size * 3,
         "sparse read unmask did not bridge a compatible gap");

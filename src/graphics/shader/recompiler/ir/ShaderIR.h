@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_
 
 #include "common/common.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -99,6 +100,7 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	bool                   byte_base_offset   = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -263,11 +265,12 @@ enum class DescriptorBindingKind : uint32_t {
 	FaultBuffer,
 	FlattenedSrt,
 	ShaderData,
+	LodStats,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -390,11 +393,15 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	uint32_t                       lod_stats_count = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t LodStatsDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return LodStatsDword() + lod_stats_count;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -479,6 +486,7 @@ struct ResourceBlock {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
+	BdaReadPlan bda_read_plan;
 	ShaderType                    stage               = ShaderType::Unknown;
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      wave_size           = 64;
@@ -497,6 +505,7 @@ struct UniformFillPlan {
 
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
+struct LinearSrtPlan;
 struct ResourcePlan {
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -511,6 +520,7 @@ struct ResourcePlan {
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
 	std::list<Inst>                     value_storage;
+	std::shared_ptr<const LinearSrtPlan> linear_srt;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -25,9 +26,29 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (m_compute_access_pending) {
+		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		m_compute_access_pending = false;
+	}
 	return m_buffer;
 }
 
+vk::CommandBuffer CommandBuffer::ChainHandle() const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	return m_buffer;
+}
+
+void CommandBuffer::ContinueComputeChain() const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	m_compute_access_pending = true;
+}
+
+vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
+	EXIT_IF(IsInvalid());
+	// The caller records a full AllCommands memory dependency immediately.
+	m_compute_access_pending = false;
+	return m_buffer;
+}
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	auto buffer = Handle();
