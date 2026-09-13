@@ -6,11 +6,17 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <vector>
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
+	struct Range {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
@@ -56,6 +62,12 @@ public:
 		}
 	}
 
+	[[nodiscard]] std::vector<Range> Intersections(uint64_t address, uint64_t size) const {
+		std::vector<Range> result;
+		ForEachIntersection(address, size, [&result](Range range) { result.push_back(range); });
+		return result;
+	}
+
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
@@ -76,7 +88,7 @@ public:
 	}
 
 	template <typename Func>
-	void ForEachInRange(uint64_t address, uint64_t size, Func&& func) const {
+	void ForEachIntersection(uint64_t address, uint64_t size, Func&& func) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it != m_ranges.begin()) {
@@ -86,7 +98,7 @@ public:
 			const auto begin = std::max(address, it->first);
 			const auto last  = std::min(end, it->second);
 			if (begin < last) {
-				func(begin, last);
+				func(Range {begin, last - begin});
 			}
 		}
 	}

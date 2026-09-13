@@ -66,6 +66,9 @@ template <typename T>
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
+[[nodiscard]] bool
+IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, const Image& image);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
 

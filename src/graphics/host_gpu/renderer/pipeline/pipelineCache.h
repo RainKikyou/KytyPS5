@@ -59,6 +59,7 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	bool                       blend_bypass[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -68,7 +69,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 158);
+static_assert(sizeof(PipelineStaticParameters) == 166);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -137,13 +138,13 @@ public:
 	                                ShaderComputeInputInfo&      input_info);
 
 	Pipeline&
-	GetGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
-	                    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
-	                    const ShaderPixelInputInfo* ps_input_info,
-	                    vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                    const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
-	                             const ShaderProgram&          compute_program);
+	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                       const ShaderPixelInputInfo* ps_input_info,
+	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
+	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;

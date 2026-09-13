@@ -2193,38 +2193,27 @@ bool StructurizeImpl(Graph& graph) {
 } // namespace
 
 bool Structurize(Graph& graph) {
-	Graph structured = graph;
-	if (StructurizeImpl(structured)) {
-		graph = std::move(structured);
+	Graph original = graph;
+	if (StructurizeImpl(graph)) {
 		return true;
 	}
 
-	const auto failure_kind = structured.failure_kind;
-	// Structurization inserts and renumbers blocks. Recover source identity for a
-	// semantic block; a synthetic block has no corresponding original diagnostic ID.
-	const auto* failed = structured.FindBlock(structured.failure_block);
-	const auto original = std::ranges::find_if(graph.blocks, [&](const BasicBlock& block) {
-		return failed != nullptr && failed->inst_begin != failed->inst_end &&
-		       block.inst_begin == failed->inst_begin && block.inst_end == failed->inst_end &&
-		       block.start_pc == failed->start_pc && block.end_pc == failed->end_pc;
-	});
-	const auto failure_block = original != graph.blocks.end() ? original->id : UINT32_MAX;
-	auto failure_reason = std::move(structured.unsupported_reason);
-	Graph routed = graph;
+	Graph failed_graph      = std::move(graph);
+	graph                   = std::move(original);
 	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
 	// Apply one route at a time and retry. Eagerly routing every matching diamond can
 	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
-		if (!RouteSharedSelectionArm(routed, route_variable)) {
+		if (!RouteSharedSelectionArm(graph, route_variable)) {
 			break;
 		}
-		structured = routed;
-		if (StructurizeImpl(structured)) {
-			graph = std::move(structured);
+		Graph routed = graph;
+		if (StructurizeImpl(routed)) {
+			graph = std::move(routed);
 			return true;
 		}
 	}
-	SetFailure(graph, failure_kind, failure_block, failure_reason);
+	graph = std::move(failed_graph);
 	return false;
 }
 
