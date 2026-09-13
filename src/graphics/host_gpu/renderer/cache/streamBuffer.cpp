@@ -1,12 +1,12 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
-#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -45,11 +45,16 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 		result = value;
 		return true;
 	}
-	const auto aligned = Common::AlignUp(value, alignment);
-	if (aligned < value) {
+	const auto remainder = value % alignment;
+	if (remainder == 0) {
+		result = value;
+		return true;
+	}
+	const auto increment = alignment - remainder;
+	if (value > std::numeric_limits<uint64_t>::max() - increment) {
 		return false;
 	}
-	result = aligned;
+	result = value + increment;
 	return true;
 }
 
@@ -117,6 +122,12 @@ vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
 
 bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
 	return address >= m_cpu_address && size <= Size() && address - m_cpu_address <= Size() - size;
+}
+
+void Buffer::Write(uint64_t offset, const void* source, uint64_t size) {
+	EXIT_IF(source == nullptr || m_mapped.empty() || offset > Size() || size > Size() - offset);
+	std::memcpy(m_mapped.data() + offset, source, static_cast<size_t>(size));
+	Flush(offset, size);
 }
 
 void Buffer::Flush(uint64_t offset, uint64_t size) {

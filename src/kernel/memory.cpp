@@ -7,7 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -69,9 +69,9 @@ constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 102
 
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
-static Graphics::RenderContext*       g_gpu_resources               = nullptr;
+static Graphics::GpuResourceManager* g_gpu_resources               = nullptr;
 
-static Graphics::RenderContext& GetGpuResources() {
+static Graphics::GpuResourceManager& GetGpuResources() {
 	EXIT_IF(g_gpu_resources == nullptr);
 	return *g_gpu_resources;
 }

@@ -192,8 +192,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 
 } // namespace
 
-Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
-	SpirvRequirements requirements {};
+void AnalyzeProgramRequirements(IR::Program& program) {
+	program.spirv_requirements.reset();
+	IR::SpirvRequirements requirements {};
+	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
@@ -249,7 +251,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
-					requirements.subgroup_ballot              = true;
+					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 				}
@@ -260,7 +262,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
-					requirements.subgroup_ballot  = true;
+					MarkBallot();
 					requirements.subgroup_shuffle = true;
 					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
 						requirements.subgroup_local_invocation_id = true;
@@ -269,19 +271,19 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 				case IR::ValueOpcode::DppUpdateU32:
 				case IR::ValueOpcode::WriteLane: {
-					requirements.subgroup_ballot              = true;
+					MarkBallot();
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
 				case IR::ValueOpcode::Permlane16U32: {
-					requirements.subgroup_ballot              = true;
+					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
 				case IR::ValueOpcode::SwizzleU32:
 				case IR::ValueOpcode::BpermuteU32: {
-					requirements.subgroup_ballot              = true;
+					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
 					break;
@@ -308,7 +310,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 		}
 	}
-	return requirements;
+	program.spirv_requirements.emplace(requirements);
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
@@ -320,7 +322,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "binary SPIR-V emitter supports compute, vertex, and pixel shaders");
 	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
-	    !program.shader_info_complete || !program.binding_layout_complete) {
+	    !program.shader_info_complete || !program.binding_layout_complete ||
+	    !program.spirv_requirements.has_value()) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
@@ -346,10 +349,14 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	AllocateOutputVariables(state);
 	DefineModule(state);
 	EmitProgram(state);
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
-	                            "main", state.interface_variables);
+	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
+	                            state.interface_variables);
 
-	return state.builder.Build();
+	auto binary = state.builder.Build();
+	if (binary.empty()) {
+		Fail(program, "SPIR-V builder returned an empty module");
+	}
+	return binary;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

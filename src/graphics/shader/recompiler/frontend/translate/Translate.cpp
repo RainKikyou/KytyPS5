@@ -908,23 +908,20 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	if (options.wave_size != 32u && options.wave_size != 64u) {
 		EXIT("shader translation requires wave32 or wave64, got %u", options.wave_size);
 	}
-	if (options.embedded_fetch != nullptr && options.stage != ShaderType::Vertex) {
-		EXIT("embedded fetch requires the vertex shader stage");
-	}
 	switch (options.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Mesh:
-			if (options.input_info.vertex == nullptr) {
+			if (options.vertex == nullptr) {
 				EXIT("vertex shader translation has no vertex input metadata");
 			}
 			return;
 		case ShaderType::Pixel:
-			if (options.input_info.pixel == nullptr) {
+			if (options.pixel == nullptr) {
 				EXIT("pixel shader translation has no pixel input metadata");
 			}
 			return;
 		case ShaderType::Compute:
-			if (options.input_info.compute == nullptr) {
+			if (options.compute == nullptr) {
 				EXIT("compute shader translation has no compute input metadata");
 			}
 			return;
@@ -949,24 +946,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
-	switch (options.stage) {
-		case ShaderType::Vertex:
-			result.scratch_dwords = options.input_info.vertex->scratch_size_dwords;
-			break;
-		case ShaderType::Mesh:
-			result.scratch_dwords = options.input_info.vertex->mesh.scratch_size_dwords;
-			break;
-		case ShaderType::Pixel:
-			result.scratch_dwords = options.input_info.pixel->scratch_size_dwords;
-			break;
-		case ShaderType::Compute:
-			result.scratch_dwords = options.input_info.compute->scratch_size_dwords;
-			break;
-		default: break; // ValidateTranslateOptions rejects unsupported stages.
-	}
-	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
-	result.cfg_failure_kind    = cfg.failure_kind;
-	result.fallback_reason     = cfg.unsupported_reason;
+	result.scratch_dwords      = options.scratch_dwords;
+	result.dispatcher_fallback = options.dispatcher_fallback;
+	result.cfg_failure_kind    = options.cfg_failure_kind;
+	result.fallback_reason     = options.fallback_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
@@ -1044,7 +1027,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		auto                 initial_exec  = IR::U1(IR::Value(true));
 		uint32_t             total_threads = 0;
-		const auto*          workgroup = ShaderWorkgroupInput(options.stage, options.input_info);
+		ShaderStageInputInfo stage_input {};
+		if (options.stage == ShaderType::Compute) {
+			stage_input.compute = options.compute;
+		} else {
+			stage_input.vertex = options.vertex;
+		}
+		const auto* workgroup = ShaderWorkgroupInput(options.stage, stage_input);
 		if (workgroup != nullptr) {
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
@@ -1061,7 +1050,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
 		                                            : IR::U32(IR::Value(0u)));
 		if (options.stage == ShaderType::Compute) {
-			const auto* cs = options.input_info.compute;
+			const auto* cs = options.compute;
 			const auto  thread_ids =
 			    cs->thread_ids_num > 0 ? std::min<uint32_t>(cs->thread_ids_num, 3u) : 0u;
 			for (uint32_t index = 0; index < thread_ids; index++) {
@@ -1092,7 +1081,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                       first_bit));
 			}
 		} else if (options.stage == ShaderType::Mesh) {
-			const auto& mesh = options.input_info.vertex->mesh;
+			const auto& mesh = options.vertex->mesh;
 			EXIT_NOT_IMPLEMENTED(options.wave_size != 64u || mesh.primitives_per_group == 0u ||
 			                     mesh.vertices_per_group > 64u || total_threads > 15u * 64u);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
@@ -1175,7 +1164,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    static_cast<IR::VectorReg>(8),
 			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
 		} else if (options.stage == ShaderType::Pixel) {
-			const auto* ps = options.input_info.pixel;
+			const auto* ps = options.pixel;
 			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr),
 				                      builtin(IR::StageInputKind::BaryCoordSmooth, 0));
@@ -1233,15 +1222,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (embedded != nullptr && IsBufferDwordLoad(instruction.opcode) &&
 			    instruction.data_dwords == embedded->components &&
 			    instruction.dst.kind == Decoder::OperandKind::Vgpr) {
-				const auto resource =
-				    ResolveEmbeddedFetchResource(*options.input_info.vertex, *embedded);
-				if (resource < 0 || resource >= options.input_info.vertex->resources_num) {
+				if (options.vertex == nullptr) {
+					EXIT("embedded vertex fetch plan has no vertex input metadata");
+				}
+				const auto resource = ResolveEmbeddedFetchResource(*options.vertex, *embedded);
+				if (resource < 0 || resource >= options.vertex->resources_num) {
 					EXIT("embedded vertex fetch at 0x%08x has no resource for attribute %d",
 					     instruction.pc, embedded->attrib_id);
 				}
 				translator.TranslateEmbeddedFetch(instruction, static_cast<uint32_t>(resource),
 				                                  embedded->components,
-				                                  options.input_info.vertex->resources[resource]);
+				                                  options.vertex->resources[resource]);
 				continue;
 			}
 			translator.TranslateInstruction(instruction);

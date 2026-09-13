@@ -69,6 +69,21 @@ static int get_protection_flag(VirtualMemory::Mode mode) {
 	return protect;
 }
 
+static VirtualMemory::Mode get_protection_flag(int mode) {
+	switch (mode) {
+		case PROT_NONE: return VirtualMemory::Mode::NoAccess;
+		case PROT_READ: return VirtualMemory::Mode::Read;
+		case PROT_WRITE: return VirtualMemory::Mode::Write;
+		case PROT_READ | PROT_WRITE: return VirtualMemory::Mode::ReadWrite; // NOLINT
+		case PROT_EXEC: return VirtualMemory::Mode::Execute;
+		case PROT_EXEC | PROT_WRITE: return VirtualMemory::Mode::ExecuteWrite; // NOLINT
+		case PROT_EXEC | PROT_READ: return VirtualMemory::Mode::ExecuteRead;   // NOLINT
+		case PROT_EXEC | PROT_WRITE | PROT_READ:
+			return VirtualMemory::Mode::ExecuteReadWrite; // NOLINT
+		default: return VirtualMemory::Mode::NoAccess;
+	}
+}
+
 // Keep automatic mappings inside the guest and GPU-addressable low window.
 #ifdef KYTY_FIXED_NOREPLACE
 static constexpr uintptr_t LOW_ARENA_LIMIT = 0x000000FC00000000ULL; // libc mspace window ceiling

@@ -6,7 +6,7 @@
 #include "common/virtualMemory.h"
 
 namespace Libs::Graphics {
-class RenderContext;
+class GpuResourceManager;
 enum class PageFaultAccess;
 } // namespace Libs::Graphics
 
