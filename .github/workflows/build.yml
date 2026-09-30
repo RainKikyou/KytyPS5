@@ -1,39 +1,48 @@
 name: Build and Release KytyPS5
+
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
   pull_request:
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   SCCACHE_GHA_ENABLED: "true"
   KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+
 jobs:
   metadata:
     name: Prepare build metadata
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release_tag.outputs.value }}
+
     steps:
       - name: Generate release tag
         id: release_tag
         shell: bash
         run: |
           echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
   windows:
     name: Build KytyPS5 (Windows)
     needs: metadata
     runs-on: windows-2022
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -44,12 +53,14 @@ jobs:
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "port_hash=$($portHash.ToLowerInvariant())" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Cache glslang
         id: glslang_cache
         uses: actions/cache@v4
         with:
           path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
           key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
+
       - name: Install glslang
         shell: pwsh
         run: |
@@ -59,6 +70,7 @@ jobs:
           }
           "$vcpkgRoot\installed\x64-windows\tools\glslang" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
         with:
@@ -67,8 +79,10 @@ jobs:
           target: desktop
           arch: win64_msvc2022_64
           cache: true
+
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: cmd
         run: |
@@ -78,6 +92,7 @@ jobs:
           clang-cl --version
           glslangValidator --version
           echo Qt6_DIR=%Qt6_DIR%
+
       - name: Configure
         shell: cmd
         run: |
@@ -93,6 +108,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+
       - name: Build
         shell: cmd
         run: |
@@ -101,29 +117,35 @@ jobs:
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+
       - name: Test
         shell: cmd
         run: |
           ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+
       - name: Install
         shell: cmd
         run: |
           cmake --install _Build/windows --prefix _Build/windows/install
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-Windows-x64
           path: _Build/windows/install/**
           if-no-files-found: error
+
   macos:
     name: Build KytyPS5 (macOS)
     needs: metadata
     runs-on: macos-15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - name: Select Xcode 26
         shell: bash
         run: |
@@ -131,9 +153,11 @@ jobs:
           test -n "$xcode_path"
           sudo xcode-select --switch "$xcode_path/Contents/Developer"
           xcodebuild -version
+
       - name: Install build dependencies
         shell: bash
         run: brew install glslang
+
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
         with:
@@ -142,8 +166,10 @@ jobs:
           target: desktop
           arch: clang_64
           cache: true
+
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: bash
         run: |
@@ -154,6 +180,7 @@ jobs:
           glslangValidator --version
           echo "Host architecture: $(uname -m)"
           echo "QT_ROOT_DIR=$QT_ROOT_DIR"
+
       - name: Configure
         shell: bash
         run: |
@@ -170,6 +197,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
       - name: Build
         shell: bash
         run: |
@@ -179,15 +207,18 @@ jobs:
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
+
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
             -R '^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+
       - name: Install
         shell: bash
         run: |
           cmake --install _Build/macos --prefix _Build/macos/install
+
       - name: Bundle MoltenVK
         shell: bash
         env:
@@ -214,6 +245,7 @@ jobs:
           install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
           install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
           codesign --force --sign - --timestamp=none "$app_dir"
+
       - name: Verify artifacts
         shell: bash
         run: |
@@ -238,6 +270,7 @@ jobs:
             codesign --verify --strict "$binary"
           done
           codesign --verify --deep --strict --verbose=2 "$app_dir"
+
       - name: Package macOS artifacts
         shell: bash
         run: |
@@ -248,21 +281,25 @@ jobs:
             zip -qry "$archive" .
           )
           unzip -t "$archive"
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-macOS-x86_64
           path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
           if-no-files-found: error
+
   linux:
     name: Build KytyPS5 (Linux)
     needs: metadata
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - name: Install build dependencies
         shell: bash
         run: |
@@ -288,6 +325,7 @@ jobs:
             lld \
             pkg-config \
             wayland-protocols
+
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
         with:
@@ -296,8 +334,10 @@ jobs:
           target: desktop
           arch: linux_gcc_64
           cache: true
+
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: bash
         run: |
@@ -308,6 +348,7 @@ jobs:
           ld.lld --version
           glslangValidator --version
           echo "Qt6_DIR=$Qt6_DIR"
+
       - name: Configure
         shell: bash
         run: |
@@ -325,6 +366,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
+
       - name: Verify SDL3 backends
         shell: bash
         run: |
@@ -338,6 +380,7 @@ jobs:
             fi
           done
           exit "$status"
+
       - name: Build
         shell: bash
         run: |
@@ -347,15 +390,18 @@ jobs:
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
+
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
             -R '^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+
       - name: Install
         shell: bash
         run: |
           cmake --install _Build/linux --prefix _Build/linux/install
+
       - name: Verify artifacts
         shell: bash
         run: |
@@ -376,12 +422,14 @@ jobs:
               -type f \( -name launcher -o -name '*.so' \) -print0
           )
           _Build/linux/install/kyty_emulator --help > /dev/null
+
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-Linux-x86_64
           path: _Build/linux/install/**
           if-no-files-found: error
+
   release:
     name: Release KytyPS5
     if: >-
@@ -397,6 +445,7 @@ jobs:
       contents: write
     env:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+
     steps:
       - name: Download Windows build
         if: needs.windows.result == 'success'
@@ -404,10 +453,75 @@ jobs:
         with:
           name: KytyPS5-Windows-x64
           path: artifacts/KytyPS5-Windows-x64
+
       - name: Download macOS build
         if: needs.macos.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: KytyPS5-macOS-x86_64
           path: artifacts/KytyPS5-macOS-x86_64
-      - name:
+
+      - name: Download Linux build
+        if: needs.linux.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: artifacts/KytyPS5-Linux-x86_64
+
+      - name: Package Windows build
+        if: needs.windows.result == 'success'
+        shell: bash
+        run: |
+          windows_dir="artifacts/KytyPS5-Windows-x64"
+          test -d "$windows_dir"
+          (
+            cd "$windows_dir"
+            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
+          )
+
+      - name: Package macOS build
+        if: needs.macos.result == 'success'
+        shell: bash
+        run: |
+          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
+          test -f "$macos_archive"
+          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
+
+      - name: Package Linux build
+        if: needs.linux.result == 'success'
+        shell: bash
+        run: |
+          linux_dir="artifacts/KytyPS5-Linux-x86_64"
+          test -d "$linux_dir"
+          chmod a+x \
+            "$linux_dir/launcher" \
+            "$linux_dir/kyty_emulator"
+          tar -C "$linux_dir" -czf \
+            "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=()
+          for artifact in \
+            "$RELEASE_NAME-Windows-x64.zip" \
+            "$RELEASE_NAME-macOS-x86_64.zip" \
+            "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
+            if [[ -f "$artifact" ]]; then
+              assets+=("$artifact")
+            fi
+          done
+          test "${#assets[@]}" -gt 0
+          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_NAME" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_NAME" "${assets[@]}" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME"
+          fi
