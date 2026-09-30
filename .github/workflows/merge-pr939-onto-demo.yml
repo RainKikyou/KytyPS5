@@ -19,16 +19,41 @@ jobs:
       - name: Merge latest upstream main and PR 939
         shell: bash
         run: |
+          set -e
           cd repo
           git config user.name "RainKikyou"
           git config user.email "RainKikyou@users.noreply.github.com"
           git remote add upstream https://github.com/KytyPS5/KytyPS5.git
           git fetch --no-tags upstream main
           git fetch --no-tags https://github.com/chenxiao07/KytyPS5.git docs/ai-optimization-skill
-          git merge --no-ff -X theirs upstream/main -m "Merge latest upstream mainline into demo-merge-pr500-pr599"
+          # Merge latest upstream mainline; on content conflicts take upstream (theirs),
+          # on modify/delete conflicts also resolve by taking upstream's side.
+          git merge --no-ff -X theirs upstream/main -m "Merge latest upstream mainline into demo-merge-pr500-pr599" || {
+            for f in $(git diff --name-only --diff-filter=U); do
+              if git ls-files -u -- "$f" | awk '{print $3}' | grep -q '^3$'; then
+                git checkout --theirs -- "$f"
+              else
+                git rm -f -- "$f"
+              fi
+            done
+            git add -A
+            git commit -m "Merge latest upstream mainline into demo-merge-pr500-pr599 (resolve conflicts taking upstream)"
+          }
+          # Keep the fork's build.yml (reference build config) untouched
           git checkout HEAD -- .github/workflows/build.yml
           git commit --amend --no-edit
-          git merge --no-ff -X theirs FETCH_HEAD -m "Merge PR #939: docs: add an AI development skill (reference)"
+          # Merge PR #939 docs
+          git merge --no-ff -X theirs FETCH_HEAD -m "Merge PR #939: docs: add an AI development skill (reference)" || {
+            for f in $(git diff --name-only --diff-filter=U); do
+              if git ls-files -u -- "$f" | awk '{print $3}' | grep -q '^3$'; then
+                git checkout --theirs -- "$f"
+              else
+                git rm -f -- "$f"
+              fi
+            done
+            git add -A
+            git commit -m "Merge PR #939: docs: add an AI development skill (reference)"
+          }
           git rm -q .github/workflows/merge-pr939-onto-demo.yml
           git commit -q -m "Remove temporary merge helper workflow"
           git log --oneline -6
