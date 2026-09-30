@@ -44,6 +44,18 @@ static DWORD GetProtectionFlag(Mode mode) {
 	return protect;
 }
 
+static Mode GetProtectionFlag(DWORD mode) {
+	switch (mode) {
+		case PAGE_NOACCESS: return Mode::NoAccess;
+		case PAGE_READONLY: return Mode::Read;
+		case PAGE_READWRITE: return Mode::ReadWrite;
+		case PAGE_EXECUTE: return Mode::Execute;
+		case PAGE_EXECUTE_READ: return Mode::ExecuteRead;
+		case PAGE_EXECUTE_READWRITE: return Mode::ExecuteReadWrite;
+		default: return Mode::NoAccess;
+	}
+}
+
 void Init() {}
 
 uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
@@ -314,7 +326,7 @@ bool FreeRange(uint64_t address, uint64_t size) {
 	return current - address == size && Free(address);
 }
 
-bool Protect(uint64_t address, uint64_t size, Mode mode) {
+bool Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nullptr) {
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {
