@@ -1,0 +1,47 @@
+name: Merge upstream main
+
+on:
+  push:
+    branches: [demo-merge-pr500-pr599]
+    paths:
+      - '.github/workflows/merge-upstream-main.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: demo-merge-pr500-pr599
+          fetch-depth: 0
+
+      - name: Merge upstream main keeping fork implementations
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "RainKikyou"
+          git config user.email "RainKikyou@users.noreply.github.com"
+          git remote add upstream https://github.com/KytyPS5/KytyPS5.git || true
+          git fetch --no-tags upstream bc193f52725cba9b73cf574a11ff2879afa608f4
+          git merge --no-commit --no-ff bc193f52725cba9b73cf574a11ff2879afa608f4 || true
+          for f in $(git diff --name-only --diff-filter=U); do
+            git checkout --ours -- "$f"
+            git add -- "$f"
+          done
+          git checkout HEAD -- src/graphics/guest_gpu/graphicsRun.h
+          git checkout HEAD -- src/graphics/guest_gpu/graphicsRun.cpp
+          git checkout HEAD -- src/graphics/guest_gpu/command_processor/commandProcessor.h
+          git checkout HEAD -- src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h
+          git checkout HEAD -- src/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp
+          git checkout HEAD -- src/graphics/shader/recompiler/frontend/translate/Vector.cpp
+          git checkout HEAD -- src/graphics/shader/recompiler/frontend/translate/Translate.cpp
+          git checkout HEAD -- src/libs/agc.cpp
+          git checkout HEAD -- tests/ShaderRecompilerComputeTests.cpp
+          sed -i '0,/#include <algorithm>/s//#include <atomic>\n#include <algorithm>/' src/graphics/presentation/videoOut.cpp
+          sed -i '0,/#include <cctype>/s//#include <cstddef>\n#include <cctype>/' src/libs/libNet.cpp
+          git add -A
+          git commit -m "Merge upstream main: add PngEnc, SharePlay connection info, VRR/WQHD video-out; keep fork graphics/shader implementations"
+          git push origin HEAD:demo-merge-pr500-pr599
