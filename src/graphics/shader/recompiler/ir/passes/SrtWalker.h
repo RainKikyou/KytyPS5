@@ -4,7 +4,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
-#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -18,8 +17,6 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
-	SrtMemorySync             sync_memory                = nullptr;
-	SrtMemorySpan             try_read_memory_span       = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
