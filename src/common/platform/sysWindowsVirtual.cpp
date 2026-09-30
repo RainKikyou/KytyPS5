@@ -326,7 +326,7 @@ bool FreeRange(uint64_t address, uint64_t size) {
 	return current - address == size && Free(address);
 }
 
-bool Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nullptr) {
+bool Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode) {
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {

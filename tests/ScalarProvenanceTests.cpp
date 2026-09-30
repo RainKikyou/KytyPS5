@@ -274,7 +274,7 @@ void TestBitScanRuntimeOps() {
         "bit-scan values were not accepted as runtime values");
 
   DescriptorValue result;
-  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result),
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
         "bit-scan descriptor evaluation failed");
   Check(result.dwords[0] == 8u && result.dwords[1] == 16u &&
             result.dwords[2] == 2u && result.dwords[3] == 0xffffffffu,
