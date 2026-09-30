@@ -1,5 +1,9 @@
 name: Fix compile errors
-on: workflow_dispatch
+on:
+  push:
+    branches: [demo-merge-pr500-pr599]
+    paths:
+      - '.github/workflows/fix-compile-errors.yml'
 permissions:
   contents: write
 jobs:
