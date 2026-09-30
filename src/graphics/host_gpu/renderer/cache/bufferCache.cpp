@@ -63,8 +63,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	++m_registration_epoch;
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
-	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
-	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
+	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		if constexpr (insert) {
 			m_page_table[page] = id;
@@ -73,7 +72,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
-	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
@@ -85,7 +83,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
+		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -94,7 +92,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
+		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
@@ -136,18 +134,58 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 	return {begin, end - begin};
 }
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
-	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
-	} else {
-		m_download_buffer.Commit();
+void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	std::vector<DownloadCopy> batch;
+	batch.reserve(copies.size());
+	uint64_t                  packed_size = 0;
+	auto&                     download    = m_download_buffer;
+	const auto flush = [&] {
+		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
+		EXIT_IF(mapped == nullptr);
+		uint64_t cursor = 0;
+		for (const auto& copy: batch) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
+			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			                  vk::AccessFlagBits::eHostRead);
+			cursor += AlignDownload(envelope_size);
+		}
+		download.Commit();
+		const auto completion_tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(completion_tick);
+		cursor = 0;
+		for (const auto& copy: batch) {
+			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+			const auto offset = cursor + copy.source_offset - source_begin;
+			download.Invalidate(base_offset + offset, copy.size);
+			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
+			cursor += AlignDownload(envelope_size);
+		}
+		batch.clear();
+		packed_size = 0;
+	};
+	for (auto copy: copies) {
+		while (copy.size != 0) {
+			const auto available = download.Size() - packed_size;
+			const auto prefix    = copy.source_offset & 3u;
+			const auto bytes     = std::min(copy.size, available - prefix);
+			DownloadCopy part {copy.buffer, copy.source_offset, copy.address, bytes};
+			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
+			(void)source_begin;
+			packed_size += AlignDownload(envelope_size);
+			batch.push_back(part);
+			copy.source_offset += bytes;
+			copy.address += bytes;
+			copy.size -= bytes;
+			if (packed_size == download.Size()) {
+				flush();
+			}
+		}
 	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
-	for (auto& copy: copies) {
-		copy.dstOffset += offset;
+	if (!batch.empty()) {
+		flush();
 	}
 	for (const auto& copy: copies) {
 		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
@@ -160,37 +198,27 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	EXIT_IF(dst == nullptr || size != 0x840);
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto              native = command.Handle();
-	vk::BufferMemoryBarrier before {};
-	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
-	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.buffer              = buffer.Handle();
-	before.offset              = 0;
-	before.size                = buffer.Size();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                       nullptr);
-	native.copyBuffer(buffer.Handle(), download.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
-
-	auto after          = before;
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = download.Handle();
-	after.offset        = offset;
-	after.size          = total_size;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = m_lod_stats_buffer.Handle();
+	barrier.size = 256 * 16;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	    vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	m_scheduler.Finish();
+	m_lod_stats_buffer.Invalidate(0, 256 * 16);
+	auto* words = reinterpret_cast<uint32_t*>(m_lod_stats_buffer.Mapped().data());
+	std::memset(dst, 0, size);
+	const uint32_t ready = 1;
+	std::memcpy(dst, &ready, sizeof(ready));
+	for (uint32_t i = 0; i < 256; ++i) {
+		const uint64_t entry = (uint64_t(words[i * 4] & 15u) << 56u) |
+		    (uint64_t(std::min(words[i * 4 + 1], 0xffffffu)) << 32u) | words[i * 4 + 1];
+		std::memcpy(static_cast<uint8_t*>(dst) + 64 + i * 8, &entry, sizeof(entry));
+		if (reset) {
+			words[i * 4] = 15;
+			words[i * 4 + 1] = words[i * 4 + 2] = words[i * 4 + 3] = 0;
 		}
 	}
 	if (reset) m_lod_stats_buffer.Flush(0, 256 * 16);
@@ -206,7 +234,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
@@ -355,14 +383,10 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 			// Fix the shadPS4 bug that reserves space opposite to the incoming stream's growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
-				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
-				                                       : LibKernel::Memory::kExtendedMemoryBase +
-				                                             LibKernel::Memory::kExtendedMemorySize) - end);
+				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
 			}
 			if (expands_right) {
-				const auto minimum = vaddr < LOWER_ADDRESS_SIZE
-				                         ? CACHING_PAGESIZE * 2
-				                         : LibKernel::Memory::kExtendedMemoryBase;
+				const auto minimum = CACHING_PAGESIZE * 2;
 				if (begin > minimum) {
 					begin -= std::min(StreamLeapSize, begin - minimum);
 				}
@@ -510,8 +534,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
-		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
@@ -548,7 +571,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();

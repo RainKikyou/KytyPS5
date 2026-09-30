@@ -2,11 +2,9 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_SAVEDATAMOUNTSLOTS_H_
 
 #include <array>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <system_error>
 
 namespace Libs::SaveData {
 
@@ -16,15 +14,12 @@ public:
 	static constexpr int    FULL  = -1;
 	static constexpr size_t COUNT = 16;
 
-	[[nodiscard]] int FindAvailable(const std::filesystem::path& directory) const {
+	[[nodiscard]] int FindAvailable(std::string_view directory) const {
 		int available = FULL;
 		for (size_t index = 0; index < m_directories.size(); index++) {
 			const auto& mounted = m_directories[index];
-			if (mounted.has_value()) {
-				std::error_code error;
-				if (*mounted == directory || std::filesystem::equivalent(*mounted, directory, error)) {
-					return BUSY;
-				}
+			if (mounted == directory) {
+				return BUSY;
 			}
 			if (!mounted.has_value() && available == FULL) {
 				available = static_cast<int>(index);
@@ -33,13 +28,7 @@ public:
 		return available;
 	}
 
-	void Mount(size_t slot, const std::filesystem::path& directory) {
-		m_directories[slot] = directory;
-	}
-
-	[[nodiscard]] const std::filesystem::path& Directory(size_t slot) const {
-		return *m_directories[slot];
-	}
+	void Mount(size_t slot, std::string_view directory) { m_directories[slot] = directory; }
 
 	[[nodiscard]] const std::string& Directory(size_t slot) const {
 		return m_directories.at(slot).value();
@@ -74,7 +63,7 @@ public:
 	}
 
 private:
-	std::array<std::optional<std::filesystem::path>, COUNT> m_directories;
+	std::array<std::optional<std::string>, COUNT> m_directories;
 };
 
 } // namespace Libs::SaveData

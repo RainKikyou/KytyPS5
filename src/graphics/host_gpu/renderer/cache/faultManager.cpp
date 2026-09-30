@@ -44,7 +44,12 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                                &m_fault_process_desc_layout),
 	    "create fault-buffer descriptor layout");
 
-	const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_graphics.device);
+	vk::ShaderModuleCreateInfo module_info {};
+	module_info.codeSize = std::size(FAULT_BUFFER_PROCESS_SPV) * sizeof(uint32_t);
+	module_info.pCode    = FAULT_BUFFER_PROCESS_SPV;
+	vk::ShaderModule module = nullptr;
+	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
+	                     "create fault-buffer shader module");
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount = 1;
@@ -134,9 +139,8 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
-			const auto address = BufferCache::GuestAddress(faults[index]);
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
+			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());

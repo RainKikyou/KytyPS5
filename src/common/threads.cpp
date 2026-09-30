@@ -2,11 +2,13 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
 #include <mutex>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
 #define KYTY_WIN_CS
@@ -25,15 +27,40 @@
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
-constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
+constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
+constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-static void SleepHighResolution100ns(uint64_t units_100ns) {
+static void SleepHighResolution100ns(uint64_t units_100ns, bool allow_spinning = true) {
 	if (units_100ns == 0) {
 		return;
+	}
+
+	// Keep spinning only where a kernel transition is
+	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
+	// per-thread high-resolution waitable timer below.
+	if (allow_spinning && units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
+		LARGE_INTEGER frequency {};
+		LARGE_INTEGER start {};
+		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&
+		    frequency.QuadPart > 0) {
+			const auto wait_ticks =
+			    static_cast<LONGLONG>((static_cast<long double>(units_100ns) *
+			                           static_cast<long double>(frequency.QuadPart)) /
+			                          10000000.0L);
+			const auto    deadline = start.QuadPart + std::max<LONGLONG>(wait_ticks, 1);
+			LARGE_INTEGER now {};
+			do {
+				if (QueryPerformanceCounter(&now) == 0) {
+					break;
+				}
+				YieldProcessor();
+			} while (now.QuadPart < deadline);
+			return;
+		}
 	}
 
 	thread_local HANDLE timer = CreateWaitableTimerExW(
@@ -105,13 +132,14 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 #endif
 
 #ifdef KYTY_POSIX_HIGH_RES_SLEEP
-// An absolute deadline preserves the requested sleep across signal interruptions.
-static void SleepHighResolutionNanos(uint64_t nanos) {
+// Spin for very short waits; use an absolute deadline for longer waits.
+static void SleepHighResolutionNanos(uint64_t nanos, bool allow_spinning = true) {
 	if (nanos == 0) {
 		return;
 	}
 
 	constexpr uint64_t NANOS_PER_SEC = 1000000000;
+	constexpr uint64_t SPIN_LIMIT_NS = 50000; // below this a context switch dominates
 
 	timespec deadline {};
 	if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
@@ -122,6 +150,17 @@ static void SleepHighResolutionNanos(uint64_t nanos) {
 	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
 	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
 	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
+
+	if (allow_spinning && nanos <= SPIN_LIMIT_NS) {
+		timespec now {};
+		do {
+			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+				return;
+			}
+		} while (now.tv_sec < deadline.tv_sec ||
+		         (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
+		return;
+	}
 
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
 	}
@@ -158,7 +197,37 @@ struct CondVarPrivate {
 #endif
 };
 
-static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
+static std::recursive_mutex                         g_cond_waiters_mutex;
+static std::vector<std::pair<int, CondVarPrivate*>> g_cond_waiters;
+static wait_poll_func_t                             g_cond_wait_poll_callback = nullptr;
+
+static void WakeCondVar(CondVarPrivate* cond_var) {
+#ifdef KYTY_WIN_CS
+	static auto func = ResolveWakeAllConditionVariable();
+	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	func(&cond_var->m_cv);
+#else
+	cond_var->m_cv.notify_all();
+#endif
+}
+
+static void RegisterCondWaiter(CondVarPrivate* cond_var) {
+	std::lock_guard lock(g_cond_waiters_mutex);
+	g_cond_waiters.emplace_back(Thread::GetThreadIdUnique(), cond_var);
+}
+
+static void UnregisterCondWaiter(CondVarPrivate* cond_var) {
+	const auto      thread_id = Thread::GetThreadIdUnique();
+	std::lock_guard lock(g_cond_waiters_mutex);
+
+	const auto it = std::find_if(g_cond_waiters.begin(), g_cond_waiters.end(),
+	                             [thread_id, cond_var](const auto& waiter) {
+		                             return waiter.first == thread_id && waiter.second == cond_var;
+	                             });
+	if (it != g_cond_waiters.end()) {
+		g_cond_waiters.erase(it);
+	}
+}
 
 struct ThreadPrivate {
 	ThreadPrivate(thread_func_t f, void* a): func(f), arg(a), m_thread(&Run, this) {}
@@ -215,6 +284,10 @@ void Thread::Detach() {
 	m_thread->m_thread.detach();
 }
 
+void Thread::Sleep(uint32_t millis) {
+	std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+}
+
 void Thread::SleepMicro(uint32_t micros) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
@@ -232,6 +305,16 @@ void Thread::SleepNano(uint64_t nanos) {
 	SleepHighResolutionNanos(nanos);
 #else
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
+#endif
+}
+
+void Thread::SleepMicroWithoutSpinning(uint32_t micros) {
+#ifdef KYTY_WIN_CS
+	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10, false);
+#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
+	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000, false);
+#else
+	std::this_thread::sleep_for(std::chrono::microseconds(micros));
 #endif
 }
 
@@ -292,6 +375,7 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
+	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -332,6 +416,7 @@ void CondVar::Wait(Mutex* mutex) {
 	}
 	cpp_lock.release();
 #endif
+	UnregisterCondWaiter(m_cond_var.get());
 }
 
 void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
@@ -340,6 +425,7 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
+	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -354,6 +440,7 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	      std::cv_status::no_timeout);
 	cpp_lock.release();
 #endif
+	UnregisterCondWaiter(m_cond_var.get());
 	return ok;
 }
 
@@ -368,13 +455,16 @@ void CondVar::Signal() {
 }
 
 void CondVar::SignalAll() {
-#ifdef KYTY_WIN_CS
-	static auto func = ResolveWakeAllConditionVariable();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	func(&m_cond_var->m_cv);
-#else
-	m_cond_var->m_cv.notify_all();
-#endif
+	WakeCondVar(m_cond_var.get());
+}
+
+void CondVar::SignalThread(int thread_id) {
+	std::lock_guard lock(g_cond_waiters_mutex);
+	for (const auto& waiter: g_cond_waiters) {
+		if (waiter.first == thread_id) {
+			WakeCondVar(waiter.second);
+		}
+	}
 }
 
 int Thread::GetThreadIdUnique() {

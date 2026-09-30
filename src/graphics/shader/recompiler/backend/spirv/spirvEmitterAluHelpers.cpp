@@ -323,18 +323,23 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	const auto bits      = state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();
+	const auto non_zero  = state.builder.AllocateId();
 	const auto subnormal = state.builder.AllocateId();
+	const auto flush     = state.builder.AllocateId();
 	const auto selected  = state.builder.AllocateId();
 	const auto ret       = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
-	                          ConstantU32(state, 0x7fffffffu));
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), sign_bits, bits,
-	                          ConstantU32(state, 0x80000000u));
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), subnormal, abs_bits,
-	                          ConstantU32(state, 0x00800000u));
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, subnormal, sign_bits, bits);
-	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), sign_bits, bits, ConstantU32(state, 0x80000000u)});
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), non_zero, abs_bits, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpULessThan, TypeBool(state), subnormal, abs_bits, ConstantU32(state, 0x00800000u)});
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal});
+	state.builder.AddFunction({OpSelect, TypeU32(state), selected, flush, sign_bits, bits});
+	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, selected});
 	return ret;
 }
 

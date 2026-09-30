@@ -16,7 +16,6 @@
 #include <windows.h>
 #undef min
 #undef max
-#undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
 #elif defined(__linux__)

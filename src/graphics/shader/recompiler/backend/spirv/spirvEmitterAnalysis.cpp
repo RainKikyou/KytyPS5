@@ -271,13 +271,10 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 
 uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
-		case ShaderType::Local:
-		case ShaderType::Vertex: return spv::ExecutionModelVertex;
-		case ShaderType::TessellationControl: return spv::ExecutionModelTessellationControl;
-		case ShaderType::TessellationEvaluation: return spv::ExecutionModelTessellationEvaluation;
-		case ShaderType::Mesh: return spv::ExecutionModelMeshEXT; // MeshEXT
-		case ShaderType::Pixel: return spv::ExecutionModelFragment;
-		default: return spv::ExecutionModelGLCompute;
+		case ShaderType::Vertex: return ExecutionModelVertex;
+		case ShaderType::Mesh: return 5365u; // MeshEXT
+		case ShaderType::Pixel: return ExecutionModelFragment;
+		default: return ExecutionModelGLCompute;
 	}
 }
 

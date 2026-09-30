@@ -69,34 +69,20 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
-void EnsureLdsStorage(EmitterState& state) {
+uint32_t LdsStorageDwordCount(const EmitterState& state) {
+	return state.compact_lds_dwords != 0 ? state.compact_lds_dwords : LdsDwordCount(state);
+}
+
+static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
 	if (ShaderWorkgroupInput(state.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	const auto define = [&](uint32_t type, uint32_t bytes) {
-		const auto array = state.builder.DecoratedType(
-		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,
-		    ConstantU32(state, std::max(LdsDwordCount(state) * 4u / bytes, 1u)));
-		const auto block = state.builder.DecoratedType(
-		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
-		const auto variable = state.builder.DefineGlobalVariable(
-		    TypePointer(state, spv::StorageClassWorkgroup, block), spv::StorageClassWorkgroup);
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
-		return variable;
-	};
-	if (state.requirements.shared_int64_atomics) {
-		state.lds_variable = define(TypeU32(state), 4u);
-		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
-		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
-	} else {
-		state.lds_variable = state.builder.DefineGlobalVariable(
-		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
-		    spv::StorageClassWorkgroup);
-	}
+	state.lds_variable = state.builder.DefineGlobalVariable(
+	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
+	    StorageClassWorkgroup);
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
@@ -110,9 +96,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	}
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	MemoryResourceAccess access {
-	    .kind = mem.kind,
-	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
+	MemoryResourceAccess access {.kind = mem.kind};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
 	                           ConstantU32(state, array_index)});
@@ -190,18 +174,12 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 			index = ConstantU32(state, state.function_lds_index_slots.at(index));
 		}
 		const auto pointer = state.builder.AllocateId();
-		const auto storage_class =
-		    access.kind == IR::ResourceKind::Scratch ? spv::StorageClassFunction
-		    : ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr
-		        ? spv::StorageClassWorkgroup
-		        : spv::StorageClassFunction;
-		if (access.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics) {
-			state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
-			                          pointer, access.object_pointer, ConstantU32(state, 0), index);
-			return pointer;
-		}
-		state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
-		                          pointer, access.object_pointer, index);
+		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
+		                           : ShaderWorkgroupInput(state.stage, state.input_info) != nullptr
+		                               ? StorageClassWorkgroup
+		                               : StorageClassFunction;
+		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
+		                           pointer, access.object_pointer, index});
 		return pointer;
 	}
 	return EmitStorageBufferElementPointer(state, access, index,

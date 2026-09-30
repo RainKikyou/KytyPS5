@@ -46,7 +46,6 @@ enum class CommandBufferDebugOp : uint32_t {
 	EopFlip,
 	EopWriteBackFlip,
 	EopOnlyFlip,
-	DispatchIndirect,
 	Unknown,
 };
 
@@ -165,11 +164,10 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
-	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    uint64_t indirect_args = 0);
 
-	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
 	void                           RebindBuffers(PreparedBindings& bindings);
@@ -185,14 +183,15 @@ private:
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
-		std::array<PreparedBindings, 3> vertex;
+		PreparedBindings                vertex;
 		std::optional<PreparedBindings> pixel;
 	};
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
+	                                                       const ShaderStageRuntime& pixel,
+	                                                       bool                      pixel_active);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
@@ -209,8 +208,7 @@ private:
 	                         bool set_bind_debug, bool set_auto_debug);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
-	                                               vk::ImageAspectFlags& feedback_aspects,
-	                                               std::span<PreparedBindings* const> stages = {});
+	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
@@ -226,8 +224,6 @@ private:
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
-	GraphicsBindings                     m_graphics_bindings;
-	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

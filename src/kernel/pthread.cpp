@@ -145,7 +145,7 @@ static uint64_t KernelGetTscFrequencyNative() {
 		}
 
 		KernelReadTscNative();
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		Common::Thread::Sleep(1);
 		KernelReadTscNative();
 
 		const auto host_start = Common::Timer::QueryPerformanceCounter();
@@ -549,6 +549,15 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
+	if (microseconds > 1) {
+		return false;
+	}
+
+	SchedulerBackoffOnce();
+	return true;
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -557,7 +566,9 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
+		if (!SleepMicroSchedulerBackoff(step)) {
+			Common::Thread::SleepMicro(step);
+		}
 		microseconds -= step;
 		KernelDispatchPendingSignalForCurrentThread();
 	}
@@ -1077,7 +1088,7 @@ static void FreeDetachedThreads(void* /*arg*/) {
 	auto* pthread_pool = g_pthread_context->GetPthreadPool();
 
 	while (true) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+		Common::Thread::Sleep(10000);
 		pthread_pool->FreeDetachedThreads();
 	}
 }
@@ -1286,6 +1297,13 @@ static int32_t GetDstSeconds() {
 	return (local_tm.tm_isdst > 0 ? 3600 : 0);
 #endif
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+static void sec_to_timeval(KernelTimeval* ts, double sec) {
+	ts->tv_sec  = static_cast<int64_t>(sec);
+	ts->tv_usec = static_cast<int64_t>((sec - static_cast<double>(ts->tv_sec)) * 1000000.0);
+}
+#endif
 
 static bool GetPosixClockId(KernelClockid clock_id, clockid_t* out) {
 	EXIT_IF(out == nullptr);
@@ -3304,6 +3322,10 @@ Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	return previous;
 }
 
+int PthreadGetUniqueId(Pthread thread) {
+	return thread != nullptr ? thread->unique_id : 0;
+}
+
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
@@ -4060,16 +4082,28 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	Common::Timer t;
+	t.Start();
 	SleepMicroWithSignalPoll(microseconds);
+	// double ts = t.GetTimeS();
+	// LOGF("\tactual: %g microseconds\n", ts * 1000000.0);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
+	PRINT_NAME();
+	LOGF("\tsleep: %u\n", seconds);
+	Common::Timer t;
+	t.Start();
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
+	double ts = t.GetTimeS();
+	LOGF("\tactual: %g seconds\n", ts);
 	return OK;
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	PRINT_NAME();
+
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}
@@ -4086,7 +4120,13 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
+	LOGF("\tnanosleep: %" PRIu64 "\n", nanos);
+
+	Common::Timer t;
+	t.Start();
 	SleepNanoWithSignalPoll(nanos);
+	double ts = t.GetTimeS();
+	LOGF("\tactual: %g nanoseconds\n", ts * 1000000000.0);
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

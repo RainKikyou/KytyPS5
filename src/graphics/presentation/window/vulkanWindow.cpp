@@ -1,6 +1,20 @@
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
-
+#include "SDL.h"
+#include "SDL_error.h"
+#include "SDL_events.h"
+#include "SDL_gamecontroller.h"
+#include "SDL_hints.h"
+#include "SDL_joystick.h"
+#include "SDL_keyboard.h"
+#include "SDL_keycode.h"
+#include "SDL_mouse.h"
+#include "SDL_pixels.h"
+#include "SDL_rwops.h"
+#include "SDL_stdinc.h"
+#include "SDL_surface.h"
+#include "SDL_thread.h"
+#include "SDL_touch.h"
+#include "SDL_video.h"
+#include "SDL_vulkan.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -35,6 +49,7 @@
 // IWYU pragma: no_include <intrin.h>
 
 #define KYTY_ENABLE_DEBUG_PRINTF
+#define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
 
@@ -139,13 +154,11 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	return static_cast<uint32_t>(-1);
 }
 
-// On failure out_device is null and out_rejections says why each device was skipped.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
                                      const std::vector<const char*>& device_extensions,
                                      SurfaceCapabilities&            out_capabilities,
-                                     vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
-                                     std::string& out_rejections) {
+                                     vk::PhysicalDevice& out_device, uint32_t& out_queue_family) {
 	EXIT_IF(instance == nullptr);
 	EXIT_IF(surface == nullptr);
 
@@ -174,22 +187,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		vk::PhysicalDeviceProperties device_properties {};
 		device.getProperties(&device_properties);
 
-		const auto reject = [&](const std::string& reason) {
-			LOGF("%s\n", reason.c_str());
-			out_rejections +=
-			    skip_device ? "; " : fmt::format("\n  {}: ", device_properties.deviceName.data());
-			out_rejections += reason;
-			skip_device = true;
-		};
-
 		LOGF("Vulkan device: %s\n", device_properties.deviceName.data());
 		if (device_properties.apiVersion < VULKAN_TARGET_API_VERSION) {
-			reject(fmt::format("Vulkan {}.{} is required, but device supports only {}.{}.{}",
-			                   VK_VERSION_MAJOR(VULKAN_TARGET_API_VERSION),
-			                   VK_VERSION_MINOR(VULKAN_TARGET_API_VERSION),
-			                   VK_VERSION_MAJOR(device_properties.apiVersion),
-			                   VK_VERSION_MINOR(device_properties.apiVersion),
-			                   VK_VERSION_PATCH(device_properties.apiVersion)));
+			LOGF("Vulkan %u.%u is required, but device supports only %u.%u.%u\n",
+			     VK_VERSION_MAJOR(VULKAN_TARGET_API_VERSION),
+			     VK_VERSION_MINOR(VULKAN_TARGET_API_VERSION),
+			     VK_VERSION_MAJOR(device_properties.apiVersion),
+			     VK_VERSION_MINOR(device_properties.apiVersion),
+			     VK_VERSION_PATCH(device_properties.apiVersion));
 			continue;
 		}
 
@@ -200,8 +205,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		features13.pNext = nullptr;
 
 		vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
-		vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
-		color_write_ext.pNext = &image_view_min_lod;
+		color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
+		color_write_ext.pNext = nullptr;
 
 		vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_enable {};
 		depth_clip_enable.sType = vk::StructureType::ePhysicalDeviceDepthClipEnableFeaturesEXT;
@@ -222,7 +227,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		fragment_barycentric.pNext = &depth_clip_control;
 		features12.pNext           = &fragment_barycentric;
 #endif
-		features13.pNext       = &features12;
+		features13.pNext = &features12;
+
+		device_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
 		device_features2.pNext = &features13;
 
 		device.getFeatures2(&device_features2);
@@ -231,82 +238,143 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		const auto queue_family = VulkanFindQueueFamily(device, surface);
 		if (queue_family == static_cast<uint32_t>(-1)) {
-			reject("No universal graphics, compute, and presentation queue");
+			LOGF("No universal graphics, compute, and presentation queue\n");
+			skip_device = true;
 		}
 
-		const auto check_feature = [&](vk::Bool32 supported, const char* name,
-		                               vk::Bool32 required = VK_TRUE) {
-			if (required == VK_TRUE && supported != VK_TRUE) {
-				reject(fmt::format("{} is not supported", name));
-			}
-		};
-
-#if defined(__APPLE__)
 		if (color_write_ext.colorWriteEnable != VK_TRUE) {
 			LOGF("colorWriteEnable is not supported\n");
-		}
-#else
-		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
+#if !defined(__APPLE__)
+			skip_device = true;
 #endif
-		check_feature(image_view_min_lod.minLod, "image view minLod");
+		}
 
-		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
-#if defined(__APPLE__)
+		if (depth_clip_control.depthClipControl != VK_TRUE) {
+			LOGF("depthClipControl is not supported\n");
+			skip_device = true;
+		}
 		if (depth_clip_enable.depthClipEnable != VK_TRUE) {
 			LOGF("depthClipEnable is not supported\n");
-		}
-#else
-		check_feature(depth_clip_enable.depthClipEnable, "depthClipEnable");
-#endif
 #if !defined(__APPLE__)
-		check_feature(device_features2.features.depthClamp, "depthClamp");
-		check_feature(fragment_barycentric.fragmentShaderBarycentric, "fragmentShaderBarycentric");
+			skip_device = true;
+#endif
+		}
+#if !defined(__APPLE__)
+		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
+			LOGF("fragmentShaderBarycentric is not supported\n");
+			skip_device = true;
+		}
 #endif
 
-		check_feature(features12.samplerMirrorClampToEdge, "samplerMirrorClampToEdge",
-		              required_features12.samplerMirrorClampToEdge);
-		check_feature(features12.timelineSemaphore, "timelineSemaphore",
-		              required_features12.timelineSemaphore);
-		check_feature(features12.shaderOutputLayer, "shaderOutputLayer",
-		              required_features12.shaderOutputLayer);
-		check_feature(features12.shaderOutputViewportIndex, "shaderOutputViewportIndex",
-		              required_features12.shaderOutputViewportIndex);
-		check_feature(features12.bufferDeviceAddress, "bufferDeviceAddress",
-		              required_features12.bufferDeviceAddress);
-		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
-		              required_features12.shaderBufferInt64Atomics);
-		check_feature(features13.robustImageAccess, "robustImageAccess");
-		check_feature(features13.dynamicRendering, "dynamicRendering",
-		              required_features13.dynamicRendering);
-		check_feature(features13.synchronization2, "synchronization2",
-		              required_features13.synchronization2);
-		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
-		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
-		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
-		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
-		check_feature(device_features2.features.largePoints, "largePoints");
-		check_feature(device_features2.features.multiViewport, "multiViewport");
-		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
-		check_feature(device_features2.features.fragmentStoresAndAtomics,
-		              "fragmentStoresAndAtomics");
+		if (required_features12.samplerMirrorClampToEdge == VK_TRUE &&
+		    features12.samplerMirrorClampToEdge != VK_TRUE) {
+			LOGF("samplerMirrorClampToEdge is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.timelineSemaphore == VK_TRUE &&
+		    features12.timelineSemaphore != VK_TRUE) {
+			LOGF("timelineSemaphore is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.shaderOutputLayer == VK_TRUE &&
+		    features12.shaderOutputLayer != VK_TRUE) {
+			LOGF("shaderOutputLayer is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.shaderOutputViewportIndex == VK_TRUE &&
+		    features12.shaderOutputViewportIndex != VK_TRUE) {
+			LOGF("shaderOutputViewportIndex is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.bufferDeviceAddress == VK_TRUE &&
+		    features12.bufferDeviceAddress != VK_TRUE) {
+			LOGF("bufferDeviceAddress is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
+		    features12.shaderBufferInt64Atomics != VK_TRUE) {
+			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
+		if (features13.robustImageAccess != VK_TRUE) {
+			LOGF("robustImageAccess is not supported\n");
+			skip_device = true;
+		}
+		if (required_features13.dynamicRendering == VK_TRUE &&
+		    features13.dynamicRendering != VK_TRUE) {
+			LOGF("dynamicRendering is not supported\n");
+			skip_device = true;
+		}
+		if (required_features13.synchronization2 == VK_TRUE &&
+		    features13.synchronization2 != VK_TRUE) {
+			LOGF("synchronization2 is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.sampleRateShading != VK_TRUE) {
+			LOGF("sampleRateShading is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.depthBiasClamp != VK_TRUE) {
+			LOGF("depthBiasClamp is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.shaderClipDistance != VK_TRUE) {
+			LOGF("shaderClipDistance is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.shaderCullDistance != VK_TRUE) {
+			LOGF("shaderCullDistance is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.largePoints != VK_TRUE) {
+			LOGF("largePoints is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.multiViewport != VK_TRUE) {
+			LOGF("multiViewport is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.fillModeNonSolid != VK_TRUE) {
+			LOGF("fillModeNonSolid is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.fragmentStoresAndAtomics != VK_TRUE) {
+			LOGF("fragmentStoresAndAtomics is not supported\n");
+			skip_device = true;
+		}
 
-		check_feature(device_features2.features.samplerAnisotropy, "samplerAnisotropy");
-		check_feature(device_features2.features.robustBufferAccess, "robustBufferAccess");
-#if defined(__APPLE__)
+		if (device_features2.features.samplerAnisotropy != VK_TRUE) {
+			LOGF("samplerAnisotropy is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.robustBufferAccess != VK_TRUE) {
+			LOGF("robustBufferAccess is not supported\n");
+			skip_device = true;
+		}
 		if (device_features2.features.depthBounds != VK_TRUE) {
 			LOGF("depthBounds is not supported\n");
-		}
-#else
-		check_feature(device_features2.features.depthBounds, "depthBounds");
+#if !defined(__APPLE__)
+			skip_device = true;
 #endif
-		check_feature(device_features2.features.shaderStorageImageWriteWithoutFormat,
-		              "shaderStorageImageWriteWithoutFormat");
+		}
+		if (device_features2.features.shaderStorageImageWriteWithoutFormat != VK_TRUE) {
+			LOGF("shaderStorageImageWriteWithoutFormat is not supported\n");
+			skip_device = true;
+		}
 
-		check_feature(device_features2.features.shaderImageGatherExtended,
-		              "shaderImageGatherExtended");
+		if (device_features2.features.shaderImageGatherExtended != VK_TRUE) {
+			LOGF("shaderImageGatherExtended is not supported\n");
+			skip_device = true;
+		}
 
-		check_feature(device_features2.features.independentBlend, "independentBlend");
-		check_feature(device_features2.features.tessellationShader, "tessellationShader");
+		if (device_features2.features.independentBlend != VK_TRUE) {
+			LOGF("independentBlend is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.tessellationShader != VK_TRUE) {
+			LOGF("tessellationShader is not supported\n");
+			skip_device = true;
+		}
 
 		if (!skip_device) {
 			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
@@ -318,7 +386,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 			for (const char* ext: device_extensions) {
 				if (!HasExtension(available_extensions, ext)) {
-					reject(fmt::format("{} is not supported", ext));
+					skip_device = true;
+					break;
 				}
 			}
 
@@ -336,46 +405,86 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 			if (!(candidate_capabilities.capabilities.supportedUsageFlags &
 			      vk::ImageUsageFlagBits::eTransferDst)) {
-				reject("Surface cannot be destination of blit");
+				LOGF("Surface cannot be destination of blit\n");
+				skip_device = true;
 			}
 		}
 
-		const auto check_format = [&](vk::Format format, vk::FormatFeatureFlags features,
-		                              const char* usage) {
-			if (!skip_device && !CheckFormat(device, format, true, features)) {
-				reject(fmt::format("Format vk::Format::e{} cannot be used as {}",
-				                   vk::to_string(format), usage));
-			}
-		};
-
-		const auto depth_features = vk::FormatFeatureFlagBits::eDepthStencilAttachment;
-		const auto texture_features =
-		    vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eTransferDst;
-		const auto storage_features =
-		    vk::FormatFeatureFlagBits::eStorageImage | vk::FormatFeatureFlagBits::eTransferDst;
-
-		check_format(vk::Format::eD32Sfloat, depth_features, "depth buffer");
-		check_format(vk::Format::eD32SfloatS8Uint, depth_features, "depth buffer");
-		check_format(vk::Format::eD16Unorm, depth_features, "depth buffer");
-		check_format(vk::Format::eBc3SrgbBlock, texture_features, "texture");
-		check_format(vk::Format::eR8G8B8A8Srgb, texture_features, "texture");
-		check_format(vk::Format::eR8Unorm, texture_features, "texture");
-		check_format(vk::Format::eR8G8Unorm, texture_features, "texture");
-
-		if (!skip_device &&
-		    !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as storage image\n");
-			check_format(vk::Format::eR8G8B8A8Unorm, storage_features, "storage image");
+		if (!skip_device && !CheckFormat(device, vk::Format::eD32Sfloat, true,
+		                                 vk::FormatFeatureFlagBits::eDepthStencilAttachment)) {
+			LOGF("Format vk::Format::eD32Sfloat cannot be used as depth buffer\n");
+			skip_device = true;
 		}
 
-		if (!skip_device &&
-		    !CheckFormat(device, vk::Format::eB8G8R8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eB8G8R8A8Srgb cannot be used as storage image\n");
-			check_format(vk::Format::eB8G8R8A8Unorm, storage_features, "storage image");
+		if (!skip_device && !CheckFormat(device, vk::Format::eD32SfloatS8Uint, true,
+		                                 vk::FormatFeatureFlagBits::eDepthStencilAttachment)) {
+			LOGF("Format vk::Format::eD32SfloatS8Uint cannot be used as depth buffer\n");
+			skip_device = true;
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eD16Unorm, true,
+		                                 vk::FormatFeatureFlagBits::eDepthStencilAttachment)) {
+			LOGF("Format vk::Format::eD16Unorm cannot be used as depth buffer\n");
+			skip_device = true;
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eBc3SrgbBlock, true,
+		                                 vk::FormatFeatureFlagBits::eSampledImage |
+		                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+			LOGF("Format vk::Format::eBc3SrgbBlock cannot be used as texture\n");
+			skip_device = true;
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, true,
+		                                 vk::FormatFeatureFlagBits::eSampledImage |
+		                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as texture\n");
+			skip_device = true;
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eR8Unorm, true,
+		                                 vk::FormatFeatureFlagBits::eSampledImage |
+		                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+			LOGF("Format vk::Format::eR8Unorm cannot be used as texture\n");
+			skip_device = true;
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eR8G8Unorm, true,
+		                                 vk::FormatFeatureFlagBits::eSampledImage |
+		                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+			LOGF("Format vk::Format::eR8G8Unorm cannot be used as texture\n");
+			skip_device = true;
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, true,
+		                                 vk::FormatFeatureFlagBits::eStorageImage |
+		                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as texture\n");
+
+			if (!skip_device && !CheckFormat(device, vk::Format::eR8G8B8A8Unorm, true,
+			                                 vk::FormatFeatureFlagBits::eStorageImage |
+			                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+				LOGF("Format vk::Format::eR8G8B8A8Unorm cannot be used as texture\n");
+				skip_device = true;
+			}
+		}
+
+		if (!skip_device && !CheckFormat(device, vk::Format::eB8G8R8A8Srgb, true,
+		                                 vk::FormatFeatureFlagBits::eStorageImage |
+		                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+			LOGF("Format vk::Format::eB8G8R8A8Srgb cannot be used as texture\n");
+
+			if (!skip_device && !CheckFormat(device, vk::Format::eB8G8R8A8Unorm, true,
+			                                 vk::FormatFeatureFlagBits::eStorageImage |
+			                                     vk::FormatFeatureFlagBits::eTransferDst)) {
+				LOGF("Format vk::Format::eB8G8R8A8Unorm cannot be used as texture\n");
+				skip_device = true;
+			}
 		}
 
 		if (!skip_device && device_properties.limits.maxSamplerAnisotropy < 16.0f) {
-			reject("maxSamplerAnisotropy < 16.0f");
+			LOGF("maxSamplerAnisotropy < 16.0f");
+			skip_device = true;
 		}
 
 		if (skip_device) {
@@ -473,24 +582,35 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	depth_clip_enable.depthClipEnable = VK_TRUE;
 
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
-	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
-	image_view_min_lod.minLod = VK_TRUE;
-	depth_clip_control.pNext  = &image_view_min_lod;
+	depth_clip_control.sType = vk::StructureType::ePhysicalDeviceDepthClipControlFeaturesEXT;
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
 	// feature structs from the chain on macOS (the renderer falls back to default depth
 	// clipping and static color-write masks).
-#if !defined(__APPLE__)
-	image_view_min_lod.pNext = &depth_clip_enable;
+#if defined(__APPLE__)
+	depth_clip_control.pNext = nullptr;
+#else
+	depth_clip_control.pNext = &depth_clip_enable;
 #endif
 	depth_clip_control.depthClipControl = VK_TRUE;
 
-	const bool workgroup_layout_extension =
-	    HasExtension(device_extensions, VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME);
-	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR supported_workgroup_layout {};
-	vk::PhysicalDeviceVulkan12Features supported_features12 {};
-	supported_features12.pNext = workgroup_layout_extension ? &supported_workgroup_layout : nullptr;
+	auto features12  = WindowContext::RequiredVulkan12Features();
+	features12.pNext = &depth_clip_control;
+
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
+	supported_features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
+
+	vk::PhysicalDeviceVulkan12Features supported_features12 {};
+	supported_features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
+	supported_features12.pNext = nullptr;
 	supported_features13.pNext = &supported_features12;
+
+#if !defined(__APPLE__)
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_fragment_barycentric {};
+	supported_fragment_barycentric.sType =
+	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+	supported_fragment_barycentric.pNext = nullptr;
+	supported_features12.pNext           = &supported_fragment_barycentric;
+#endif
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -499,8 +619,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 	supported_robustness2.pNext = nullptr;
 	if (robustness2_ext_enabled) {
-		supported_robustness2.pNext = supported_features13.pNext;
-		supported_features13.pNext = &supported_robustness2;
+#if defined(__APPLE__)
+		supported_features12.pNext = &supported_robustness2;
+#else
+		supported_fragment_barycentric.pNext = &supported_robustness2;
+#endif
 	}
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -528,54 +651,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		supported_features2.pNext = &provoking_vertex;
 	}
 	physical_device.getFeatures2(&supported_features2);
-
-	auto features12 = WindowContext::RequiredVulkan12Features();
-	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
-	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
-	workgroup_layout.workgroupMemoryExplicitLayout =
-	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
-	workgroup_layout.pNext = &depth_clip_control;
-	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
-	                                             : static_cast<void*>(&depth_clip_control);
-	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
-		Log::WriteToConsoleAndLog(fmt::format(
-		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
-		    "workgroupMemoryExplicitLayout={}. Continuing with the selected Vulkan device.\n",
-		    features12.shaderSharedInt64Atomics != VK_FALSE,
-		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
-	}
-	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
-
-	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
-
-	vk::PhysicalDeviceVulkan11Properties properties11 {};
-	properties11.pNext = &subgroup_size_control;
-
-	vk::PhysicalDeviceFloatControlsProperties float_controls {};
-	float_controls.pNext = &properties11;
-	vk::PhysicalDeviceProperties2 properties2 {};
-	properties2.pNext = &float_controls;
-
-	if (graphics.mesh_shader_enabled) {
-		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
-	}
-	physical_device.getProperties2(&properties2);
-
-	graphics.subgroup_size                 = properties11.subgroupSize;
-	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
-	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
-	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
-	graphics.compute_subgroup_size_control_enabled =
-	    supported_features13.subgroupSizeControl == VK_TRUE &&
-	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
-	    subgroup_size_control.minSubgroupSize <= 64 &&
-	    subgroup_size_control.maxSubgroupSize >= 64;
-
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
-	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
-	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
-	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
-	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -593,23 +668,46 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		     graphics.mesh_shader_properties.maxMeshOutputPrimitives,
 		     graphics.mesh_shader_properties.maxMeshSharedMemorySize);
 	}
-	// VulkanFindPhysicalDevice already checked the required creation features. These
-	// requirements are specific to this creation path and are not part of device selection.
+	const auto required_features12 = WindowContext::RequiredVulkan12Features();
+	const auto required_features13 = WindowContext::RequiredVulkan13Features();
+	EXIT_NOT_IMPLEMENTED(required_features12.samplerMirrorClampToEdge == VK_TRUE &&
+	                     supported_features12.samplerMirrorClampToEdge != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.timelineSemaphore == VK_TRUE &&
+	                     supported_features12.timelineSemaphore != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features13.dynamicRendering == VK_TRUE &&
+	                     supported_features13.dynamicRendering != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features13.synchronization2 == VK_TRUE &&
+	                     supported_features13.synchronization2 != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderClipDistance != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderCullDistance != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.largePoints != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.multiViewport != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.fillModeNonSolid != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
-	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
+	                     supported_features12.shaderOutputLayer != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputViewportIndex == VK_TRUE &&
+	                     supported_features12.shaderOutputViewportIndex != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.bufferDeviceAddress == VK_TRUE &&
+	                     supported_features12.bufferDeviceAddress != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
+	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
+#if !defined(__APPLE__)
+	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
+#endif
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.robustBufferAccess       = VK_TRUE;
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
-	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
-	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
@@ -621,15 +719,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
-	device_features.shaderFloat64 =
-	    supported_features2.features.shaderFloat64 &&
-	    float_controls.shaderSignedZeroInfNanPreserveFloat64 &&
-	    float_controls.shaderRoundingModeRTEFloat32;
-	// if (device_features.shaderFloat64 && !float_controls.shaderDenormPreserveFloat64) {
-	// 	Log::WriteToConsoleAndLog(
-	// 	    "WARNING: Vulkan device does not guarantee FP64 denormal preservation; "
-	// 	    "continuing with native FP64 arithmetic. Very small values may be flushed to zero.\n");
-	// }
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -701,13 +790,27 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	return device;
 }
 
-static void VulkanGetExtensions(VulkanExtensions& r) {
+static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
+	EXIT_IF(window == nullptr);
+
 	uint32_t required_extensions_count = 0;
 
-	const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&required_extensions_count);
-	EXIT_NOT_IMPLEMENTED(extensions == nullptr);
+	auto sdl_result = SDL_Vulkan_GetInstanceExtensions(window, &required_extensions_count, nullptr);
+
+	EXIT_NOT_IMPLEMENTED(sdl_result == SDL_FALSE);
 	EXIT_NOT_IMPLEMENTED(required_extensions_count == 0);
-	r.required_extensions.assign(extensions, extensions + required_extensions_count);
+
+	r.required_extensions =
+	    std::vector<const char*>(required_extensions_count); // @suppress("Ambiguous problem")
+	std::memset(r.required_extensions.data(), 0,
+	            sizeof(const char*) * r.required_extensions.size());
+
+	sdl_result = SDL_Vulkan_GetInstanceExtensions(window, &required_extensions_count,
+	                                              r.required_extensions.data());
+
+	EXIT_NOT_IMPLEMENTED(sdl_result == SDL_FALSE);
+	EXIT_NOT_IMPLEMENTED(required_extensions_count == 0);
+	EXIT_NOT_IMPLEMENTED(required_extensions_count != r.required_extensions.size());
 
 	r.available_extensions =
 	    EnumerateVulkan<vk::ExtensionProperties>( // @suppress("Ambiguous problem")
@@ -888,7 +991,7 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	VulkanExtensions r;
-	VulkanGetExtensions(r);
+	VulkanGetExtensions(window, r);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -986,16 +1089,15 @@ void WindowContext::CreateVulkan() {
 	}
 
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
+	                             &native_surface) == SDL_FALSE) {
 		EXIT("Could not create a Vulkan surface");
 	}
 	surface = native_surface;
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -1014,13 +1116,13 @@ void WindowContext::CreateVulkan() {
 	}
 #endif
 
-	std::string rejected_devices;
+	uint32_t queue_family = static_cast<uint32_t>(-1);
+
 	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
-	                         graphic_ctx.physical_device, graphic_ctx.queue_family,
-	                         rejected_devices);
+	                         graphic_ctx.physical_device, queue_family);
 
 	if (graphic_ctx.physical_device == nullptr) {
-		EXIT("Could not find suitable device:%s", rejected_devices.c_str());
+		EXIT("Could not find suitable device");
 	}
 
 	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
@@ -1064,7 +1166,6 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
@@ -1110,8 +1211,8 @@ void WindowContext::RecreateSurface() {
 		surface = nullptr;
 	}
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
+	                             &native_surface) == SDL_FALSE) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
 	surface = native_surface;
@@ -1147,7 +1248,7 @@ WindowContext::~WindowContext() {
 		SDL_DestroyWindow(window);
 		window = nullptr;
 	}
-	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
+	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
 }
 
 } // namespace Libs::Graphics

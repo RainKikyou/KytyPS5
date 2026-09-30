@@ -58,49 +58,22 @@ struct RenderDepthInfo {
 	bool                        stencil_meta_clear_enable = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;
-	vk::StencilOpState          stencil_front;
-	vk::StencilOpState          stencil_back;
+	PipelineStencilStaticState  stencil_static_front;
+	PipelineStencilStaticState  stencil_static_back;
+	PipelineStencilDynamicState stencil_dynamic_front;
+	PipelineStencilDynamicState stencil_dynamic_back;
 	ImageId                     image_id;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
-
-inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,
-                                                 const ImageViewInfo& target,
-                                                 const ImageViewInfo& sampled) {
-	if (!ImageRangeOverlaps(target.base_level, target.level_count, sampled.base_level,
-	                        sampled.level_count) ||
-	    !ImageRangeOverlaps(target.base_layer, target.layer_count, sampled.base_layer,
-	                        sampled.layer_count)) {
-		return {};
-	}
-	return draw_writes & sampled.aspect;
-}
-
-inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
-	switch (layout) {
-		case vk::ImageLayout::eDepthReadOnlyOptimal:
-		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
-			return vk::ImageAspectFlagBits::eDepth;
-		case vk::ImageLayout::eStencilReadOnlyOptimal:
-		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
-			return vk::ImageAspectFlagBits::eStencil;
-		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
-		case vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT:
-		case vk::ImageLayout::eGeneral:
-			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-		default:
-			return {};
-	}
-}
 
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();
 	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
 	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
-	// The attachment layout must permit load clears as well as draw writes.
-	const bool depth_write   = static_cast<bool>(writes & vk::ImageAspectFlagBits::eDepth);
+	// LoadOp clears are separate from guest depth writes.
+	const bool depth_write   = depth.depth_write_enable;
 	const bool stencil_write = static_cast<bool>(writes & vk::ImageAspectFlagBits::eStencil);
 	if (!has_stencil) {
 		return depth_write ? vk::ImageLayout::eDepthAttachmentOptimal

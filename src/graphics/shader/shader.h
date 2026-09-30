@@ -33,17 +33,7 @@ struct ComputeShaderInfo;
 struct ShaderRegisters;
 } // namespace HW
 
-enum class ShaderType {
-	Unknown,
-	Vertex,
-	Pixel,
-	Fetch,
-	Compute,
-	Mesh,
-	Local,
-	TessellationControl,
-	TessellationEvaluation
-};
+enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute, Mesh };
 
 namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
@@ -51,10 +41,10 @@ struct CompiledShaderInfo;
 
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	ShaderRecompiler::IR::ResourceSnapshot          resources;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr && resources != nullptr;
+		return program != nullptr;
 	}
 };
 
@@ -97,11 +87,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 		}
 	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveStep() const {
-		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
-			case Prospero::PrimitiveType::kTriFan:
-			case Prospero::PrimitiveType::kTriStrip: return 1u;
-			default: return InputPrimitiveSize();
-		}
+		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
+		           ? 1u : InputPrimitiveSize();
 	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveCount(uint32_t vertices) const {
 		const auto size = InputPrimitiveSize();
@@ -112,16 +99,6 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	}
 };
 
-struct ShaderTessellationInputInfo {
-	uint32_t input_control_points  = 0;
-	uint32_t output_control_points = 0;
-	uint32_t ls_stride             = 0;
-	uint32_t hs_stride             = 0;
-	uint32_t domain                = 0;
-	uint32_t partitioning          = 0;
-	uint32_t output_topology       = 0;
-};
-
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -129,23 +106,19 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
-	ShaderType                  logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
-	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
-	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
-	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
@@ -159,11 +132,9 @@ struct ShaderPixelInputInfo {
 	bool                                           lod_stats_subgroup           = false;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
-	uint32_t                                       wave_size                    = 64;
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
-	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
@@ -178,9 +149,6 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
-	bool                                           dual_source_blending         = false;
-	// Export logical alpha through MRT1 for blending after channel swizzling.
-	bool                                           alpha_blend_source_remap     = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -311,6 +279,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
+bool ShaderAddressValid(uint64_t addr);
 
 } // namespace Libs::Graphics
 

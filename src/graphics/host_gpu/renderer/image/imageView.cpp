@@ -362,12 +362,6 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
-	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
-		min_lod.minLod = static_cast<float>(normalized.base_level) +
-		                 static_cast<float>(normalized.min_lod) / 256.0f;
-		usage.pNext    = &min_lod;
-	}
 	vk::ImageViewCreateInfo create {};
 	create.pNext                           = &usage;
 	create.image                           = image.image;
@@ -391,12 +385,6 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
 	}
-	SetVulkanObjectNameF(
-	    m_graphics.device, view,
-	    "Kyty.ImageView[guest=0x{:016x} format={} aspect=0x{:x} mip={}+{} layer={}+{}]",
-	    info.data.address, static_cast<uint32_t>(normalized.format),
-	    static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
-	    normalized.level_count, normalized.base_layer, normalized.layer_count);
 	views.push_back({normalized, view});
 	return view;
 }

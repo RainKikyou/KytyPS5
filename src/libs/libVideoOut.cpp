@@ -1,6 +1,5 @@
 #include "common/abi.h"
 #include "graphics/presentation/videoOut.h"
-#include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -15,8 +14,6 @@ LIB_DEFINE(InitVideoOut_1) {
 
 	LIB_FUNC("Up36PTk687E", VideoOut::VideoOutOpen);
 	LIB_FUNC("uquVH4-Du78", VideoOut::VideoOutClose);
-	LIB_FUNC("WkYtyOg30do", VideoOut::VideoOutSetFlipMaster);
-	LIB_FUNC("MBlv8YWoyOk", VideoOut::VideoOutAddBufferAttributeOption);
 	LIB_FUNC("PjS5uASwcV8", VideoOut::VideoOutSetBufferAttribute2);
 	LIB_FUNC("rKBUtgRrtbk", VideoOut::VideoOutRegisterBuffers2);
 	LIB_FUNC("HuViW4HnrOw", VideoOut::VideoOutSubmitChangeBufferAttribute2);
@@ -49,21 +46,5 @@ LIB_DEFINE(InitVideoOut_1) {
 }
 
 } // namespace LibGen5
-
-namespace LibGen5::VrrStatus {
-
-LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
-
-static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
-	// The observed guest call passes no arguments.
-	// Return success for Kyty's fixed-refresh path.
-	return OK;
-}
-
-LIB_DEFINE(InitVideoOutVrrStatus_1) {
-	LIB_FUNC("kP2L8t3j-aM", VideoOutVrrStatus_kP2L8t3j_aM);
-}
-
-} // namespace LibGen5::VrrStatus
 
 } // namespace Libs

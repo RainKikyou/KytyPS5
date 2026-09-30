@@ -1,7 +1,6 @@
 #include "configurationItem.h"
 
 #include "configuration.h"
-#include "gameContent.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -15,7 +14,6 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
-#include <QPixmap>
 #include <QSize>
 #include <QStringList>
 #include <QStyle>
@@ -77,6 +75,10 @@ void AddStatus(QComboBox* combo, Configuration::GameStatus status) {
 void SetStatus(QComboBox* combo, Configuration::GameStatus status) {
 	const int index = combo->findData(static_cast<int>(status));
 	combo->setCurrentIndex(index >= 0 ? index : 0);
+}
+
+QIcon StandardIcon(QStyle::StandardPixmap icon) {
+	return QApplication::style()->standardIcon(icon);
 }
 
 QString GetPathText(const Configuration& info) {
@@ -156,7 +158,7 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 	m_comment_edit->setFrame(false);
 	parent->setItemWidget(this, CommentsColumn, m_comment_edit);
 
-	Update(true);
+	Update();
 	SetRunning(false);
 
 	setData(SizeColumn, Qt::UserRole, qint64(-1));
@@ -172,14 +174,7 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 		watcher->deleteLater();
 	});
 	watcher->setFuture(QtConcurrent::run([path = m_info->basedir]() -> qint64 {
-		if (path.isEmpty()) {
-			return -1;
-		}
-		const QFileInfo info(path);
-		if (GameContent::IsArchive(path)) {
-			return info.size();
-		}
-		if (!QDir(path).exists()) {
+		if (path.isEmpty() || !QDir(path).exists()) {
 			return -1;
 		}
 		qint64       bytes = 0;
@@ -197,7 +192,7 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 
 ConfigurationItem::~ConfigurationItem() = default;
 
-void ConfigurationItem::Update(bool reload_icon) {
+void ConfigurationItem::Update() {
 	const auto display_text = GetDisplayText(*m_info);
 	const auto path         = GetPathText(*m_info);
 
@@ -218,12 +213,6 @@ void ConfigurationItem::Update(bool reload_icon) {
 		m_comment_edit->setText(m_info->game_comment);
 	}
 
-	if (reload_icon) {
-		const auto icon_data = GameContent::ReadFile(
-		    m_info->basedir, QStringLiteral("sce_sys/icon0.png"), GameContent::MaxImageSize);
-		QPixmap icon;
-		m_icon = !icon_data.isEmpty() && icon.loadFromData(icon_data) ? QIcon(icon) : QIcon {};
-	}
 	UpdateIcon();
 	UpdateStatusIndicator();
 }
@@ -282,17 +271,18 @@ void ConfigurationItem::SetCompatibilityEditable(bool editable) {
 }
 
 void ConfigurationItem::UpdateIcon() {
-	if (!m_icon.isNull()) {
-		setIcon(NameColumn, m_icon);
+	const QString icon_file = QDir(m_info->basedir).filePath(QStringLiteral("sce_sys/icon0.png"));
+	if (QFileInfo::exists(icon_file)) {
+		setIcon(NameColumn, QIcon(icon_file));
 		return;
 	}
 
 	if (m_running) {
-		setIcon(NameColumn, QApplication::style()->standardIcon(QStyle::SP_MediaPlay));
+		setIcon(NameColumn, StandardIcon(QStyle::SP_MediaPlay));
 	} else if (m_info->custom_settings) {
-		setIcon(NameColumn, QApplication::style()->standardIcon(QStyle::SP_FileIcon));
+		setIcon(NameColumn, StandardIcon(QStyle::SP_FileIcon));
 	} else {
-		setIcon(NameColumn, QApplication::style()->standardIcon(QStyle::SP_ComputerIcon));
+		setIcon(NameColumn, StandardIcon(QStyle::SP_ComputerIcon));
 	}
 }
 

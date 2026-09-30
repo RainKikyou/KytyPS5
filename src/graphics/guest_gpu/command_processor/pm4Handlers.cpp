@@ -1333,13 +1333,15 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
+		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
+		cp.DispatchIndirectAddress(args_addr, buffer[2]);
 		return 3;
 	}
 
-	const auto base_addr = cp.GetDispatchIndirectArgsBaseAddress();
-	EXIT_NOT_IMPLEMENTED(base_addr == 0);
-	cp.DispatchIndirect(base_addr + buffer[0], buffer[1]);
+	uint32_t data_offset = buffer[0];
+	uint32_t mode        = buffer[1];
+
+	cp.DispatchIndirect(data_offset, mode);
 
 	return 2;
 }
@@ -1497,10 +1499,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
+		cp.ProcessIndirectBuffer({then_buffer, then_num_dw});
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
+		cp.ProcessIndirectBuffer({else_buffer, else_num_dw});
 	}
 
 	return payload_dw;
@@ -1961,7 +1963,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
 
 	return 3;
 }
@@ -2019,14 +2021,6 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			if (raw_cmd_offset == 0x24au && value == 0u) {
-				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
-				if (!logged.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
-				}
-				continue;
-			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 
@@ -2281,6 +2275,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
+		bool queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
@@ -2288,9 +2283,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				cp.BufferFlush();
+				queued = true;
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
+		}
+		if (queued) {
+			cp.BufferFlush();
 		}
 	};
 
@@ -2329,9 +2327,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
-			cp.BufferFlush();
-		}
+		cp.BufferFlush();
 
 		return 7;
 	}
@@ -3643,11 +3639,6 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	// Toolkit state restoration emits the compiler's GS-front allocation
-	// metadata here. Native GS resource registers already carry that allocation.
-	g_hw_sh_indirect_func[0x0ca] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
@@ -3667,13 +3658,12 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS;
-	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS; offset++) {
-		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetHsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS,
-			                                   value);
-		};
-	}
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
@@ -3831,25 +3821,6 @@ void GraphicsInitJmpTablesShIndirect() {
 void GraphicsInitJmpTablesUcIndirect() {
 	for (auto& func: g_hw_uc_indirect_func) {
 		func = nullptr;
-	}
-	for (uint32_t i = 0; i < 4; ++i) {
-		g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrControlPoint(0, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_X, value);
-		};
-		g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_LEFT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrControlPoint(1, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_Y, value);
-		};
-	}
-	for (uint32_t i = 0; i < 2; ++i) {
-		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrAlpha(0, cmd_offset - Pm4::FSR_ALPHA_LEFT_X, value);
-		};
-		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrAlpha(1, cmd_offset - Pm4::FSR_ALPHA_LEFT_Y, value);
-		};
-		g_hw_uc_indirect_func[Pm4::FSR_WINDOW_LEFT + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-			cp.GetUcfg().SetFsrWindow(cmd_offset - Pm4::FSR_WINDOW_LEFT, value);
-		};
 	}
 
 	g_hw_uc_indirect_func[Pm4::GE_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {

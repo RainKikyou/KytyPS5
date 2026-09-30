@@ -1,10 +1,9 @@
 #include "mainDialog.h"
 
+#include "common.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
-#include "controllerLightbar.h"
-#include "gameContent.h"
 #include "patchesDialog.h"
 #include "updateChecker.h"
 
@@ -18,7 +17,6 @@
 #include <QIODevice>
 #include <QLabel>
 #include <QMessageBox>
-#include <QObject>
 #include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
@@ -28,8 +26,6 @@
 #include <QTextStream>
 #include <QVariant>
 #include <QtCore>
-
-#include <cstdint>
 
 #include "ui_main_dialog.h"
 
@@ -62,8 +58,20 @@ constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
 constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
 
+class DetachableProcess: public QProcess {
+	Q_OBJECT;
+
+public:
+	explicit DetachableProcess(QObject* parent = nullptr): QProcess(parent) {}
+	void Detach() {
+		this->waitForStarted();
+		setProcessState(QProcess::NotRunning);
+	}
+};
+
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
+	KYTY_QT_CLASS_NO_COPY(MainDialogPrivate);
 
 public:
 	explicit MainDialogPrivate(QObject* parent = nullptr): QObject(parent) {}
@@ -89,10 +97,9 @@ private:
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
-	ControllerLightbar m_lightbar;
 	QString         m_interpreter;
 
-	QProcess m_process;
+	/*DetachableProcess*/ QProcess m_process;
 
 	QPointer<ConfigurationItem> m_running_item;
 };
@@ -105,7 +112,6 @@ MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPriv
 }
 
 MainDialogPrivate::~MainDialogPrivate() {
-	m_process.disconnect(this);
 	delete m_ui;
 }
 
@@ -115,6 +121,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
+	m_ui->widget->SetMainDialog(main_dialog);
 	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
 	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
 	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
@@ -124,12 +131,6 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
 	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
-	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
-	        [this](const QString& color) {
-		        if (m_process.state() == QProcess::NotRunning) {
-			        m_lightbar.SetColor(color);
-		        }
-	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
@@ -144,14 +145,16 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		m_ui->widget->WriteSettings();
 	});
 
-	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
-		if (state == QProcess::NotRunning) {
-			if (m_running_item != nullptr) {
-				m_running_item->SetRunning(false);
-			}
-			Update();
-		}
-	});
+	connect(&m_process,
+	        static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+	        [this](int /*exitCode*/, QProcess::ExitStatus /*exitStatus*/) {
+		        if (m_running_item != nullptr) {
+			        m_running_item->SetRunning(false);
+		        }
+		        Update();
+	        });
+
+	// connect(main_dialog, &MainDialog::Quit, [=]() { m_process.Detach(); });
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
@@ -225,12 +228,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--screen-height" << r.at(1);
 	args << "--user-name" << info.user_name;
 	args << "--user-id" << QString::number(info.user_id);
-	if (!info.audio_input_device.isEmpty()) {
-		args << "--mic" << info.audio_input_device;
-	}
-	if (!info.controller_color.isEmpty()) {
-		args << "--controller-color" << info.controller_color;
-	}
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
@@ -239,9 +236,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--fullscreen";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
@@ -257,9 +251,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--profile";
 	}
 	args << "--spirv-debug-printf" << "false";
-	if (info.amd_cpu_enabled) {
-		args << "--amd-cpu";
-	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
 		args << "--redzone";
@@ -273,7 +264,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 
 	QString game = info.basedir;
-	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {
+	if (!info.elf.isEmpty()) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
@@ -505,10 +496,11 @@ void MainDialogPrivate::Run() {
 	}
 
 	m_running_item->SetRunning(true);
-	m_lightbar.Stop();
 
-	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
-	m_main_dialog->RunInterpreter(&m_process, *info);
+	Configuration info;
+	info.CopyFrom(m_running_item->GetInfo());
+	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
+	m_main_dialog->RunInterpreter(&m_process, info);
 
 	Update();
 }
@@ -521,16 +513,10 @@ void MainDialogPrivate::Update() {
 	if (run_enabled) {
 		const auto& info = item->GetInfo();
 		auto        dir  = info.basedir;
-		run_enabled      = !dir.isEmpty() && (QDir(dir).exists() || GameContent::IsArchive(dir));
+		run_enabled      = !dir.isEmpty() && QDir(dir).exists();
 	}
 
 	m_ui->widget->SetRunEnabled(run_enabled);
-	if (m_process.state() != QProcess::NotRunning) {
-		m_lightbar.Stop();
-		return;
-	}
-	m_lightbar.SetColor(item != nullptr ? m_ui->widget->CreateConfiguration(*item)->controller_color
-	                                    : m_ui->widget->GetGlobalControllerColor());
 }
 
 #include "mainDialog.moc"

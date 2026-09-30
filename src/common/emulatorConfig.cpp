@@ -43,14 +43,6 @@ int32_t GetUserId() {
 	return g_config->user_id;
 }
 
-const std::string& GetAudioInputDevice() {
-	return g_config->audio_input_device;
-}
-
-const std::optional<ControllerColor>& GetControllerColor() {
-	return g_config->controller_color;
-}
-
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
@@ -61,14 +53,6 @@ int32_t GetGpuIndex() {
 
 bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
-}
-
-bool VrEnabled() {
-	return g_config->vr_enabled;
-}
-
-bool AmdCpuEnabled() {
-	return g_config->amd_cpu_enabled;
 }
 
 uint32_t GetVblankFrequency() {
@@ -137,10 +121,6 @@ bool RenderDocEnabled() {
 
 bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
-}
-
-bool TessellationEnabled() {
-	return g_config->tessellation_enabled;
 }
 
 bool PlayGoHackEnabled() {

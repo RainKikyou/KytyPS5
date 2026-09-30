@@ -72,49 +72,10 @@
           <property name="toolTip"><string>Language</string></property>
          </widget>
         </item>
-        <item row="3" column="0">
-         <widget class="QLabel" name="label_controller_color">
-          <property name="text"><string>DualSense lightbar:</string></property>
-         </widget>
-        </item>
-        <item row="3" column="1">
-         <layout class="QHBoxLayout" name="controllerColorLayout">
-          <item>
-           <widget class="QPushButton" name="button_controller_color">
-            <property name="toolTip"><string>Choose and preview a fixed LED color. Bluetooth DualSense may take several seconds to update.</string></property>
-            <property name="text"><string>Custom</string></property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QPushButton" name="button_controller_color_reset">
-            <property name="toolTip"><string>Let the game control the lightbar</string></property>
-            <property name="text"><string>Default</string></property>
-           </widget>
-          </item>
-         </layout>
-        </item>
        </layout>
       </widget>
      </item>
-     <item row="2" column="0">
-      <widget class="QGroupBox" name="audio_group">
-       <property name="title"><string>Audio</string></property>
-       <layout class="QFormLayout" name="audioLayout">
-        <property name="fieldGrowthPolicy">
-         <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
-        </property>
-        <item row="0" column="0">
-         <widget class="QLabel" name="label_audio_input_device">
-          <property name="text"><string>Microphone:</string></property>
-         </widget>
-        </item>
-        <item row="0" column="1">
-         <widget class="QComboBox" name="comboBox_audio_input_device"/>
-        </item>
-       </layout>
-      </widget>
-     </item>
-     <item row="0" column="1" rowspan="3">
+     <item row="0" column="1" rowspan="2">
       <widget class="QGroupBox" name="graphics_group">
        <property name="title">
         <string>Graphics &amp;&amp; display</string>
@@ -188,16 +149,10 @@
           <property name="text"><string>Enable readback</string></property>
          </widget>
         </item>
-        <item row="7" column="1">
-         <widget class="QCheckBox" name="checkBox_tessellation">
-          <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
-          <property name="text"><string>Enable tessellation support (experimental)</string></property>
-         </widget>
-        </item>
        </layout>
       </widget>
      </item>
-     <item row="3" column="0" colspan="2">
+     <item row="2" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>
@@ -298,18 +253,20 @@
        <property name="title">
         <string>Compatibility</string>
        </property>
-       <layout class="QVBoxLayout" name="compatibilityLayout">
-        <item>
-         <widget class="QCheckBox" name="checkBox_amd_cpu">
-          <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-          <property name="text"><string>AMD CPU patch (experimental)</string></property>
-         </widget>
-        </item>
+       <layout class="QHBoxLayout" name="compatibilityLayout">
         <item>
          <widget class="QCheckBox" name="checkBox_red_zone_protection">
           <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
-          <property name="text"><string>Windows SysV red zone crash protection (experimental)</string></property>
+          <property name="text"><string>Windows SysV red zone crash protection (Experimental)</string></property>
          </widget>
+        </item>
+        <item>
+         <spacer name="compatibilitySpacer">
+          <property name="orientation"><enum>Qt::Horizontal</enum></property>
+          <property name="sizeHint" stdset="0">
+           <size><width>40</width><height>20</height></size>
+          </property>
+         </spacer>
         </item>
        </layout>
       </widget>
@@ -356,4 +313,12 @@
   </customwidget>
  </customwidgets>
  <resources/>
+ <connections>
+  <connection>
+   <sender>cancel_button</sender>
+   <signal>clicked()</signal>
+   <receiver>ConfigurationEditDialog</receiver>
+   <slot>reject()</slot>
+  </connection>
+ </connections>
 </ui>

@@ -33,7 +33,6 @@ constexpr Type U32             = Type::U32;
 constexpr Type U64             = Type::U64;
 constexpr Type F16             = Type::F16;
 constexpr Type F32             = Type::F32;
-constexpr Type F64             = Type::F64;
 constexpr Type U32x2           = Type::U32x2;
 constexpr Type U32x3           = Type::U32x3;
 constexpr Type U32x4           = Type::U32x4;
@@ -91,7 +90,6 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::SetAttribute:
-		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
@@ -173,7 +171,6 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicUMax32:
 		case ValueOpcode::SharedAtomicAnd32:
 		case ValueOpcode::SharedAtomicOr32:
-		case ValueOpcode::SharedAtomicOr64:
 		case ValueOpcode::SharedAtomicXor32: return SharedAccess::Atomic;
 		case ValueOpcode::DataAppend: return SharedAccess::Append;
 		case ValueOpcode::DataConsume: return SharedAccess::Consume;
@@ -183,7 +180,6 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 
 uint32_t SharedComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
-		case ValueOpcode::SharedAtomicOr64:
 		case ValueOpcode::LoadSharedU32x2:
 		case ValueOpcode::WriteSharedU32x2: return 2u;
 		case ValueOpcode::LoadSharedU32x3:
@@ -223,8 +219,6 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
-		case ValueOpcode::ImageAtomicFMin32:
-		case ValueOpcode::ImageAtomicFMax32:
 			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};
 		default: return {};
 	}

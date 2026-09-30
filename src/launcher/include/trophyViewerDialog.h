@@ -1,6 +1,8 @@
 #ifndef TROPHY_VIEWER_DIALOG_H
 #define TROPHY_VIEWER_DIALOG_H
 
+#include "common.h"
+
 #include <QDialog>
 
 class QTabWidget;
@@ -8,6 +10,8 @@ class QWidget;
 
 class Configuration;
 class TrophyViewerDialog: public QDialog {
+	KYTY_QT_CLASS_NO_COPY(TrophyViewerDialog);
+
 public:
 	explicit TrophyViewerDialog(QWidget* parent = nullptr);
 

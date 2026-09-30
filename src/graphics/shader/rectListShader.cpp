@@ -46,15 +46,12 @@ std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
 	}
 
 	std::vector<Parameter> parameters;
-	std::array<bool, 32> output_locations {};
 	for (const auto input: active_inputs) {
 		const auto input_location = ShaderPixelParameterMappedLocation(*pixel_info, input);
-		const auto output_location = ShaderPixelParameterLocation(*pixel_info, active_inputs, input);
-		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0 &&
-		    !output_locations[output_location]) {
-			parameters.push_back({input_location, output_location,
+		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0) {
+			parameters.push_back({input_location,
+			                      ShaderPixelParameterLocation(*pixel_info, active_inputs, input),
 			                      ShaderPixelParameterIsFlat(*pixel_info, input)});
-			output_locations[output_location] = true;
 		}
 	}
 	return parameters;
@@ -67,12 +64,12 @@ public:
 		builder.AddMemoryModel(
 		    {Word(spv::AddressingModel::Logical), Word(spv::MemoryModel::GLSL450)});
 
-		void_type       = builder.Type(spv::OpTypeVoid);
-		uint_type       = builder.Type(spv::OpTypeInt, 32u, 0u);
-		int_type        = builder.Type(spv::OpTypeInt, 32u, 1u);
-		float_type      = builder.Type(spv::OpTypeFloat, 32u);
-		vec4_float_type = builder.Type(spv::OpTypeVector, float_type, 4u);
-		function_type   = builder.Type(spv::OpTypeFunction, void_type);
+		void_type       = Type(spv::Op::OpTypeVoid);
+		uint_type       = Type(spv::Op::OpTypeInt, 32u, 0u);
+		int_type        = Type(spv::Op::OpTypeInt, 32u, 1u);
+		float_type      = Type(spv::Op::OpTypeFloat, 32u);
+		vec4_float_type = Type(spv::Op::OpTypeVector, float_type, 4u);
+		function_type   = Type(spv::Op::OpTypeFunction, void_type);
 
 		per_vertex_type = builder.DecoratedType(
 		    Word(spv::Op::OpTypeStruct), {vec4_float_type},
@@ -80,16 +77,16 @@ public:
 		      {0u, Word(spv::Decoration::BuiltIn), Word(spv::BuiltIn::Position)}},
 		     {Word(spv::Op::OpDecorate), {Word(spv::Decoration::Block)}}});
 
-		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
-		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
-		if (model == spv::ExecutionModelTessellationControl) {
-			bool_type        = builder.Type(spv::OpTypeBool);
-			vec2_bool_type   = builder.Type(spv::OpTypeVector, bool_type, 2u);
-			vec2_float_type  = builder.Type(spv::OpTypeVector, float_type, 2u);
-			ptr_output_float = Pointer(spv::StorageClassOutput, float_type);
+		ptr_input_vec4_float  = Pointer(spv::StorageClass::Input, vec4_float_type);
+		ptr_output_vec4_float = Pointer(spv::StorageClass::Output, vec4_float_type);
+		if (model == spv::ExecutionModel::TessellationControl) {
+			bool_type        = Type(spv::Op::OpTypeBool);
+			vec2_bool_type   = Type(spv::Op::OpTypeVector, bool_type, 2u);
+			vec2_float_type  = Type(spv::Op::OpTypeVector, float_type, 2u);
+			ptr_output_float = Pointer(spv::StorageClass::Output, float_type);
 		} else {
-			vec3_float_type = builder.Type(spv::OpTypeVector, float_type, 3u);
-			ptr_input_float = Pointer(spv::StorageClassInput, float_type);
+			vec3_float_type = Type(spv::Op::OpTypeVector, float_type, 3u);
+			ptr_input_float = Pointer(spv::StorageClass::Input, float_type);
 		}
 	}
 
@@ -169,8 +166,8 @@ public:
 			Store(Access(ptr_output_vec4_float, outputs[i], invocation), value);
 		}
 
-		builder.AddFunction(spv::OpReturn);
-		builder.AddFunction(spv::OpFunctionEnd);
+		Emit(spv::Op::OpReturn);
+		Emit(spv::Op::OpFunctionEnd);
 		return builder.Build();
 	}
 
@@ -192,22 +189,27 @@ public:
 			      Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
 		}
 
-		builder.AddFunction(spv::OpReturn);
-		builder.AddFunction(spv::OpFunctionEnd);
+		Emit(spv::Op::OpReturn);
+		Emit(spv::Op::OpFunctionEnd);
 		return builder.Build();
 	}
 
 private:
+	template <typename... Args>
+	uint32_t Type(spv::Op opcode, Args... operands) {
+		return builder.Type(Word(opcode), {Word(operands)...});
+	}
+
 	uint32_t Constant(uint32_t type, uint32_t value) {
 		return builder.Constant(Word(spv::Op::OpConstant), type, {value});
 	}
 
 	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
-		return builder.Type(spv::OpTypePointer, storage, type);
+		return Type(spv::Op::OpTypePointer, storage, type);
 	}
 
 	uint32_t Array(uint32_t type, uint32_t size) {
-		return builder.Type(spv::OpTypeArray, type, Uint(size));
+		return Type(spv::Op::OpTypeArray, type, Uint(size));
 	}
 
 	template <typename... Args>
@@ -225,6 +227,11 @@ private:
 	}
 
 	template <typename... Args>
+	void Emit(spv::Op opcode, Args... operands) {
+		builder.AddFunction({Word(opcode), Word(operands)...});
+	}
+
+	template <typename... Args>
 	uint32_t Access(uint32_t pointer_type, uint32_t base, Args... indices) {
 		return Result(spv::Op::OpAccessChain, pointer_type, base, Word(indices)...);
 	}
@@ -233,7 +240,7 @@ private:
 		return Result(spv::Op::OpLoad, type, pointer);
 	}
 
-	void Store(uint32_t pointer, uint32_t value) { builder.AddFunction(spv::OpStore, pointer, value); }
+	void Store(uint32_t pointer, uint32_t value) { Emit(spv::Op::OpStore, pointer, value); }
 
 	uint32_t Int(uint32_t value) { return Constant(int_type, value); }
 

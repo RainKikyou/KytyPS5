@@ -3,9 +3,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
-#include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -174,10 +172,10 @@ uint32_t AddressF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::
 	           : Unary(ctx.state, OpBitcast, TypeF32(ctx.state), value);
 }
 
-ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
+ImageSampleLayout Layout(const IR::MemoryInfo& mem, ImageDimension dimension) {
 	ImageSampleLayout layout;
 	uint32_t          cursor = 0;
-	const auto&       info   = ImageDimensionInfoFor(mem.image_dimension);
+	const auto&       info   = ImageDimensionInfoFor(dimension);
 	if (HasFlag(mem, Decoder::ImageSampleFlagOffset)) layout.offset = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagBias)) layout.bias = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagCompare)) layout.dref = cursor++;
@@ -215,7 +213,8 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 }
 
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  uint32_t first, uint32_t components, bool cube = false) {
+                  uint32_t first, uint32_t components) {
+	const bool cube = ctx.state.program.info.images.at(mem.resource).cube;
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
 	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
@@ -683,9 +682,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto sampled   = MakeSampledImage(state, mem.resource, mem.sampler);
 		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
-		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
-		    CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components,
-		             image.cube));
+		    {OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
+		     CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components)});
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
 		                      ConstantU32(state, 0)};
 		for (uint32_t index = 0; index < 2u; index++) {
@@ -745,7 +743,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
 		const auto  dimension      = image.dimension;
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);
-		const auto  layout         = Layout(mem);
+		const auto  layout         = Layout(mem, dimension);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
@@ -753,16 +751,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
 			return true;
 		}
+		const auto coord =
+		    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components);
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
-			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-			                            dimension_info.coordinate_components, image.cube);
-			if (HasFlag(mem, Decoder::ImageSampleFlagLod)) {
-				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-				if (!warned.test_and_set(std::memory_order_relaxed)) {
-					std::fputs("Warning: approximating IMAGE_GATHER4_L at mip level 0; explicit LOD is ignored.\n",
-					           stderr);
-				}
-			}
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
@@ -853,11 +844,6 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
 			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
@@ -890,11 +876,11 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                         ? &state.program.descriptor_sources[image.source]
 		                         : nullptr;
 		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
-		    handle->NumArgs() == 0u) {
+		    source->indirect_image->key_arg >= handle->NumArgs()) {
 			ctx.Fail(inst, "has invalid indirect image key provenance");
 			return true;
 		}
-		const auto key = ctx.Def(handle->Arg(0));
+		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
 		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
@@ -981,25 +967,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
-	if (image_info.access == IR::ImageAccess::Atomic) {
+	if (atomic_opcode != 0u) {
 		const auto dimension = image.dimension;
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			           const auto pointer      = state.builder.AllocateId();
-			           const auto pointer_type = state.builder.Type(
-			               spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
-			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
-			                                     StorageImageDescriptorPointer(state, mem.resource),
-			                                     CoordU32(ctx, mem, *address, dimension),
-			                                     ConstantU32(state, 0));
-			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
-			               op == IR::ValueOpcode::ImageAtomicFMax32) {
-				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
-				                               [&](uint32_t old) {
-					                               return EmitFloatAtomicReplacement(
-					                                   state, old, ctx.Arg(inst, 2),
-					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
-				                               });
-			           }
+			           const auto pointer = state.builder.AllocateId();
+			           const auto pointer_type =
+			               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
+			           state.builder.AddFunction(
+			               {OpImageTexelPointer, pointer_type, pointer,
+			                StorageImageDescriptorPointer(state, mem.resource),
+			                CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0)});
 			           const auto old = state.builder.AllocateId();
 			           state.builder.AddFunction({atomic_opcode, TypeU32(state), old, pointer,
 			                                      ConstantU32(state, ScopeDevice),

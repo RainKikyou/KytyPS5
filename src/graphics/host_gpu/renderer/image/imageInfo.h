@@ -17,17 +17,17 @@ namespace Libs::Graphics {
 
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
-enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
+enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
 struct ImageMetadataInfo {
 	GuestRange          range;
-	ImageMetadataKind   kind                 = ImageMetadataKind::None;
-	uint32_t            control              = 0;
-	uint32_t            clear_word           = 0;
-	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
-	bool                stencil_compressed   = false;
-	bool                clear_register_valid = false;
-	bool                dcc_alpha_msb        = true;
+	ImageMetadataKind   kind               = ImageMetadataKind::None;
+	uint32_t            control            = 0;
+	uint32_t            dcc_clear_word           = 0;
+	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
+	bool                stencil_compressed = false;
+	bool                dcc_clear_register_valid = false;
+	bool                dcc_alpha_msb            = true;
 };
 
 struct ImageSubresources {
@@ -97,24 +97,9 @@ struct ImageInfo {
 		       bytes_per_block == other.bytes_per_block;
 	}
 	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
-		if (container.resources.levels > container.mip_layout.size()) {
-			return -1;
-		}
-		for (uint32_t level = 0; level < container.resources.levels; level++) {
-			if (SliceOf(container, static_cast<int32_t>(level)) >= 0) {
-				return static_cast<int32_t>(level);
-			}
-		}
-		return -1;
-	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
-		if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
-		    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
-		    container.resources.layers == 0 || mip < 0 ||
-		    static_cast<uint32_t>(mip) >= container.resources.levels ||
-		    container.resources.levels > container.mip_layout.size() ||
-		    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
-		    data.End() > container.data.End()) {
+		if (!IsCompatible(container) || tile_mode != container.tile_mode || resources.levels != 1 ||
+		    container.resources.layers == 0 ||
+		    container.resources.levels > container.mip_layout.size()) {
 			return -1;
 		}
 		if (HasStencil() != container.HasStencil() ||
@@ -123,36 +108,75 @@ struct ImageInfo {
 			return -1;
 		}
 
-		const auto  level  = static_cast<uint32_t>(mip);
-		const auto& layout = container.mip_layout[level];
-		if (extent.width != std::max(container.extent.width >> level, 1u) ||
-		    extent.height != std::max(container.extent.height >> level, 1u) ||
-		    extent.depth != container.extent.depth || mip_layout[0].pitch != layout.pitch ||
-		    mip_layout[0].height != layout.height || layout.size == 0 ||
-		    layout.size % container.resources.layers != 0 ||
-		    container.data.size % container.resources.layers != 0 ||
-		    data.size % resources.layers != 0) {
+		int32_t mip = -1;
+		for (uint32_t level = 0; level < container.resources.levels; level++) {
+			const auto& layout = container.mip_layout[level];
+			if (layout.size == 0 || layout.size % container.resources.layers != 0 ||
+			    container.data.address > UINT64_MAX - layout.offset) {
+				continue;
+			}
+			const auto mip_base   = container.data.address + layout.offset;
+			const auto slice_size = layout.size / container.resources.layers;
+			if (slice_size == 0 || mip_base > UINT64_MAX - layout.size) {
+				continue;
+			}
+			const auto mip_end = mip_base + layout.size;
+			if (data.address >= mip_base && data.address < mip_end &&
+			    (data.address - mip_base) % slice_size == 0) {
+				mip = static_cast<int32_t>(level);
+				break;
+			}
+		}
+		if (mip < 0) {
 			return -1;
 		}
 
-		// PS5 block slices contain the entire reversed mip chain.
-		const auto slice_stride = container.data.size / container.resources.layers;
-		const auto child_stride = data.size / resources.layers;
-		if (child_stride != layout.size / container.resources.layers ||
-		    layout.offset >= slice_stride || child_stride > slice_stride - layout.offset ||
-		    (resources.layers > 1 && child_stride != slice_stride)) {
+		const auto level = static_cast<uint32_t>(mip);
+		if (extent.width != std::max(container.extent.width >> level, 1u) ||
+		    extent.height != std::max(container.extent.height >> level, 1u)) {
 			return -1;
 		}
-		const auto address_delta = data.address - container.data.address;
-		if (address_delta < layout.offset || (address_delta - layout.offset) % slice_stride != 0) {
+		const auto mip_depth = std::max(container.extent.depth >> level, 1u);
+		if (container.type == Prospero::ImageType::kColor3D &&
+		    type == Prospero::ImageType::kColor2D) {
+			if (resources.layers != mip_depth) {
+				return -1;
+			}
+		} else if (type != container.type) {
 			return -1;
 		}
-		const auto layer = (address_delta - layout.offset) / slice_stride;
-		if (layer > INT32_MAX || layer >= container.resources.layers ||
-		    resources.layers > container.resources.layers - layer) {
+		return mip;
+	}
+	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
+		if (!IsCompatible(container) || type != container.type || mip < 0 ||
+		    static_cast<uint32_t>(mip) >= container.resources.levels ||
+		    container.resources.levels > container.mip_layout.size() ||
+		    container.resources.layers == 0 || data.size == 0) {
 			return -1;
 		}
-		return static_cast<int32_t>(layer);
+		const auto level = static_cast<uint32_t>(mip);
+		if (extent.width != std::max(container.extent.width >> level, 1u) ||
+		    extent.height != std::max(container.extent.height >> level, 1u)) {
+			return -1;
+		}
+		const auto& layout = container.mip_layout[level];
+		if (layout.size == 0 || layout.size % container.resources.layers != 0 ||
+		    container.data.address > UINT64_MAX - layout.offset) {
+			return -1;
+		}
+		const auto slice_size = layout.size / container.resources.layers;
+		if (slice_size == 0 || data.size % slice_size != 0) {
+			return -1;
+		}
+		const auto mip_base = container.data.address + layout.offset;
+		if (data.address < mip_base) {
+			return -1;
+		}
+		const auto address_delta = data.address - mip_base;
+		if (address_delta % data.size != 0 || address_delta / data.size > INT32_MAX) {
+			return -1;
+		}
+		return static_cast<int32_t>(address_delta / data.size);
 	}
 };
 
@@ -162,7 +186,6 @@ struct ImageViewInfo {
 	vk::ImageAspectFlags aspect      = vk::ImageAspectFlagBits::eColor;
 	uint32_t             base_level  = 0;
 	uint32_t             level_count = 1;
-	uint32_t             min_lod     = 0; // U4.8 clamp relative to base_level.
 	uint32_t             base_layer  = 0;
 	uint32_t             layer_count = 1;
 	vk::ComponentMapping mapping     = {};
@@ -171,10 +194,9 @@ struct ImageViewInfo {
 	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
 		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
 		       base_level == rhs.base_level && level_count == rhs.level_count &&
-		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
-		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
-		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
-		       mapping.a == rhs.mapping.a && usage == rhs.usage;
+		       base_layer == rhs.base_layer && layer_count == rhs.layer_count &&
+		       mapping.r == rhs.mapping.r && mapping.g == rhs.mapping.g &&
+		       mapping.b == rhs.mapping.b && mapping.a == rhs.mapping.a && usage == rhs.usage;
 	}
 };
 
@@ -340,9 +362,7 @@ struct VideoOutFormatPolicy {
 	VideoOutPixelFormatInfo info;
 };
 
-inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
-
-inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -351,8 +371,6 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
-    {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
-     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,

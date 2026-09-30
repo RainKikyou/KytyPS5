@@ -527,12 +527,7 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			} else if (*format == '*') {
 				// const int prec = (int)va_arg(va, int);
 				const int prec = VaArg_int(va_list);
-				if (prec < 0) {
-					// A negative dynamic precision is treated as omitted.
-					flags &= ~FLAGS_PRECISION;
-				} else {
-					precision = static_cast<unsigned int>(prec);
-				}
+				precision      = prec > 0 ? static_cast<unsigned int>(prec) : 0U;
 				format++;
 			}
 		}

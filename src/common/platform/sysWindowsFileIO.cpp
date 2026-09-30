@@ -14,7 +14,6 @@
 #include "common/stringUtils.h"
 
 #include <cstdlib>
-#include <cstring>
 #include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -57,10 +56,10 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	}
 
 	if (t == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
-		return FILE_FLAG_SEQUENTIAL_SCAN;
+		return SYS_FILE_CACHE_SEQUENTIAL_SCAN;
 	}
 
-	return FILE_ATTRIBUTE_NORMAL;
+	return SYS_FILE_CACHE_AUTO;
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -134,6 +133,10 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 			*bytes_written = size;
 		}
 	}
+}
+
+void SysFileWrite(uint32_t n, sys_file_t& f) {
+	SysFileWrite(&n, 4, f);
 }
 
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
@@ -266,27 +269,19 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return 0;
 }
 
-bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
-	const bool directory_path = !name.empty() && !name.has_filename() && name != name.root_path();
-	WIN32_FILE_ATTRIBUTE_DATA info {};
-	if (GetFileAttributesExW(directory_path ? name.parent_path().c_str() : name.c_str(),
-	                         GetFileExInfoStandard, &info) == 0) {
-		return false;
-	}
-	const bool file = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-	if (directory_path && file) {
-		return false;
-	}
-	*is_file = file;
-	*size = *is_file ? ((static_cast<uint64_t>(info.nFileSizeHigh) << 32u) | info.nFileSizeLow) : 0;
-	return true;
-}
-
 uint64_t SysFileSize(const std::filesystem::path& file_name) {
-	bool is_file;
-	uint64_t size = 0;
-	SysFileGetInfo(file_name, &is_file, &size);
-	return size;
+	LARGE_INTEGER             s;
+	WIN32_FILE_ATTRIBUTE_DATA a;
+
+	auto wide = file_name.wstring();
+	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
+		return 0;
+	}
+
+	s.HighPart = static_cast<LONG>(a.nFileSizeHigh);
+	s.LowPart  = a.nFileSizeLow;
+
+	return s.QuadPart;
 }
 
 bool SysFileTruncate(sys_file_t& f, uint64_t size) {
@@ -354,15 +349,17 @@ bool SysFileIsError(sys_file_t& f) {
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	bool is_file;
-	uint64_t size;
-	return SysFileGetInfo(path, &is_file, &size) && !is_file;
+	auto  wide = path.wstring();
+	DWORD a    = GetFileAttributesW(wide.c_str());
+	return a != INVALID_FILE_ATTRIBUTES &&
+	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	bool is_file;
-	uint64_t size;
-	return SysFileGetInfo(name, &is_file, &size) && is_file;
+	auto  wide = name.wstring();
+	DWORD a    = GetFileAttributesW(wide.c_str());
+	return a != INVALID_FILE_ATTRIBUTES &&
+	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
@@ -482,11 +479,66 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	return ok;
 }
 
-void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	const auto pattern = path / L"*";
+void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
+	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
+	if (!Common::EndsWith(real_path, "/")) {
+		real_path += "/";
+	}
 
-	WIN32_FIND_DATAW data {};
-	HANDLE h = FindFirstFileW(pattern.c_str(), &data);
+	std::string pattern = real_path + "*";
+
+	HANDLE           h = nullptr;
+	WIN32_FIND_DATAW data;
+
+	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
+
+	if (h == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	do {
+		std::filesystem::path file_name(data.cFileName);
+		auto                  file_name_str = Common::PathToString(file_name);
+
+		if (file_name_str == "." || file_name_str == "..") {
+			continue;
+		}
+
+		if ((data.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u) {
+			SysFileFindFiles(std::filesystem::path(real_path) / file_name, out);
+		} else {
+			sys_file_find_t r {};
+
+			r.path_with_name              = std::filesystem::path(real_path) / file_name;
+			r.size                        = (static_cast<uint64_t>(data.nFileSizeHigh) << 32u) +
+			                                static_cast<uint64_t>(data.nFileSizeLow);
+			r.last_access_time.is_invalid = false;
+			r.last_access_time.time       = data.ftLastAccessTime;
+			r.last_write_time.is_invalid  = false;
+			r.last_write_time.time        = data.ftLastWriteTime;
+
+			out.push_back(r);
+		}
+
+	} while (FindNextFileW(h, &data) != 0);
+
+	FindClose(h);
+}
+
+void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
+	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
+	if (!Common::EndsWith(real_path, "/")) {
+		real_path += "/";
+	}
+
+	std::string pattern = real_path + "*";
+
+	HANDLE           h = nullptr;
+	WIN32_FIND_DATAW data;
+
+	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
 		return;
@@ -500,7 +552,7 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 		r.is_file = ((data.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
 		r.name    = Common::PathToString(file_name);
 
-		out.push_back(std::move(r));
+		out.push_back(r);
 
 	} while (FindNextFileW(h, &data) != 0);
 

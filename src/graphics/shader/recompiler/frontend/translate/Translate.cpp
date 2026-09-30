@@ -4,22 +4,11 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
-
-static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
-	return {
-	    .control        = operand.dpp_ctrl,
-	    .row_mask       = operand.dpp_row_mask,
-	    .bank_mask      = operand.dpp_bank_mask,
-	    .fetch_inactive = operand.dpp_fetch_inactive,
-	    .bound_control  = operand.dpp_bound_ctrl,
-	    .dpp8           = operand.dpp8,
-	};
-}
 
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
@@ -42,7 +31,6 @@ Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst
 			continue;
 		}
 		destination.dpp                = true;
-		destination.dpp8               = source.dpp8;
 		destination.dpp_ctrl           = source.dpp_ctrl;
 		destination.dpp_row_mask       = source.dpp_row_mask;
 		destination.dpp_bank_mask      = source.dpp_bank_mask;
@@ -119,7 +107,6 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	result.dpp_fetch_inactive = false;
 	result.dpp_bound_ctrl     = false;
 	result.dpp                = false;
-	result.dpp8               = false;
 	return result;
 }
 
@@ -181,8 +168,14 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 
 IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value) {
 	if (operand.dpp) {
-		value =
-		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
+		const IR::DppMoveFlags flags {
+		    .control        = static_cast<uint16_t>(operand.dpp_ctrl),
+		    .row_mask       = static_cast<uint8_t>(operand.dpp_row_mask),
+		    .bank_mask      = static_cast<uint8_t>(operand.dpp_bank_mask),
+		    .fetch_inactive = operand.dpp_fetch_inactive,
+		    .bound_control  = operand.dpp_bound_ctrl,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, flags));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
@@ -226,28 +219,9 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
-	if (type == IR::Type::U64 || type == IR::Type::F64) {
-		auto pair = ReadU32Pair(operand);
-		if (type == IR::Type::F64) {
-			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
-				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
-			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-				const auto bits = operand.value == 0x3e22f983u
-				                      ? 0x3fc45f306dc9c882ull
-				                      : std::bit_cast<uint64_t>(static_cast<double>(
-				                            std::bit_cast<float>(operand.value)));
-				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
-			}
-			if (operand.absolute) {
-				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
-			}
-			if (operand.negate) {
-				pair[1] = ir.BitwiseXor(pair[1], IR::U32(IR::Value(0x80000000u)));
-			}
-		}
-		const auto bits = ir.ConstructU64(pair[0], pair[1]);
-		return type == IR::Type::F64 ? ir.Emit(IR::ValueOpcode::BitCastF64U64, {bits}) : IR::Value(bits);
+	if (type == IR::Type::U64) {
+		const auto pair = ReadU32Pair(operand);
+		return ir.ConstructU64(pair[0], pair[1]);
 	}
 	auto bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	if (TypesOverlap(type, IR::Type::F32) && !TypesOverlap(type, IR::Type::U32)) {
@@ -317,7 +291,6 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
 			ir.SetScalarReg(reg, value);
-			program.scalar_writes.push_back({current_pc, reg});
 			ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 			if (IR::RegIndex(reg) > 0u) {
 				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(IR::RegIndex(reg) - 1u),
@@ -329,8 +302,15 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			const auto reg = static_cast<IR::VectorReg>(operand.reg);
 			const auto old = ir.GetVectorReg(reg);
 			if (operand.dpp) {
-				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
-				                        DppFlags(operand)));
+				const IR::DppMoveFlags flags {
+				    .control        = static_cast<uint16_t>(operand.dpp_ctrl),
+				    .row_mask       = static_cast<uint8_t>(operand.dpp_row_mask),
+				    .bank_mask      = static_cast<uint8_t>(operand.dpp_bank_mask),
+				    .fetch_inactive = operand.dpp_fetch_inactive,
+				    .bound_control  = operand.dpp_bound_ctrl,
+				};
+				value = IR::U32(
+				    ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()}, flags));
 			} else {
 				value = ir.Select(ir.GetExec(), value, old);
 			}
@@ -423,10 +403,6 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		const auto bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {value}));
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
-	}
-	if (type == IR::Type::F64) {
-		value = ir.Emit(IR::ValueOpcode::BitCastU64F64, {value});
-		type  = IR::Type::U64;
 	}
 	if (type == IR::Type::U64) {
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
@@ -566,7 +542,10 @@ IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_la
 
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
-	auto value = Read16LaneBits(operand, high_lane);
+	auto value = ReadU16LaneRaw(operand, high_lane);
+	if (high_lane ? operand.negate_hi : operand.negate) {
+		value = ir.BitwiseAnd(ir.ISub(IR::U32(IR::Value(0u)), value), IR::U32(IR::Value(0xffffu)));
+	}
 	if (sign_extend || operand.sdwa_sext) {
 		value = IR::U32(
 		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {value, IR::Value(0u), IR::Value(16u)}));
@@ -578,13 +557,12 @@ IR::U32 Translator::ReadU16AsU32(const Decoder::Operand& operand, bool sign_exte
 	return ReadU16LaneAsU32(operand, false, sign_extend);
 }
 
-IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_lane) {
+IR::U32 Translator::ReadF16LaneBits(const Decoder::Operand& operand, bool high_lane) {
 	auto value = ReadU16LaneRaw(operand, high_lane);
 	if (operand.absolute) {
 		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0x7fffu)));
 	}
 	if (high_lane ? operand.negate_hi : operand.negate) {
-		// RDNA2 source NEG flips the sign bit, including packed integer operands.
 		value = ir.BitwiseXor(value, IR::U32(IR::Value(0x8000u)));
 	}
 	return value;
@@ -711,13 +689,11 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 				                    IR::U1(IR::Value(false)));
 			}
 			ir.SetScalarReg(reg, mask[0]);
-			program.scalar_writes.push_back({current_pc, reg});
 			// A wave32 VALU mask destination must not overwrite the neighboring SGPR.
 			if ((write_64 || program.wave_size == 64u) &&
 			    IR::RegIndex(reg) + 1u < IR::NumScalarRegs) {
 				const auto high = static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u);
 				ir.SetScalarReg(high, mask[1]);
-				program.scalar_writes.push_back({current_pc, high});
 				ir.SetThreadBitScalarReg(high, IR::U1(IR::Value(false)));
 				ir.SetScalarMaskTag(high, IR::U1(IR::Value(false)));
 			}
@@ -760,61 +736,53 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
-void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::BlockInfo& info) {
-	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
-		IR::U1 condition;
-		switch (kind) {
-			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
-			case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
-			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-			case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-			case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-			case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
-			case CFG::BranchCondition::ScalarInstruction:
-				EXIT_IF(instruction_branch_condition.IsEmpty());
-				condition = instruction_branch_condition;
-				break;
-			default: EXIT("block %u has an invalid native branch condition", source.id);
+void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info) {
+	if (source.terminator.goto_value >= 0) {
+		if (source.terminator.goto_variable == UINT32_MAX) {
+			EXIT("block %u sets an invalid goto variable", source.id);
 		}
-		return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
-	};
-	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
-		const auto& value = graph.expressions.at(index);
-		switch (value.op) {
-			case CFG::ConditionExpression::Op::Constant: return IR::U1(IR::Value(value.lhs != 0));
-			case CFG::ConditionExpression::Op::Variable: return ir.GetGotoVariable(value.lhs);
-			case CFG::ConditionExpression::Op::Native:
-				return native_condition(static_cast<CFG::BranchCondition>(value.lhs));
-			case CFG::ConditionExpression::Op::Not: return ir.LogicalNot(self(self, value.lhs));
-			case CFG::ConditionExpression::Op::Or:
-				return ir.LogicalOr(self(self, value.lhs), self(self, value.rhs));
-		}
-		EXIT("invalid CFG condition expression");
-	};
-	for (const auto& assignment: source.assignments) {
-		ir.SetGotoVariable(assignment.variable, expression(expression, assignment.expression));
+		ir.SetGotoVariable(source.terminator.goto_variable,
+		                   IR::U1(IR::Value(source.terminator.goto_value != 0)));
 	}
-	const auto& term = source.terminator;
-	if (term.kind == CFG::TerminatorKind::IndirectBranch) {
-		if (term.indirect_selector_code != UINT32_MAX) {
-			info.indirect_target = ReadScalarCode(term.indirect_selector_code);
-		} else if (term.indirect_pc_sgpr != UINT32_MAX) {
-			info.indirect_target = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr));
+	if (source.terminator.kind == CFG::TerminatorKind::IndirectBranch) {
+		if (source.terminator.indirect_selector_code != UINT32_MAX) {
+			info.indirect_target = ReadScalarCode(source.terminator.indirect_selector_code);
+		} else if (source.terminator.indirect_pc_sgpr != UINT32_MAX) {
+			info.indirect_target =
+			    ir.GetScalarReg(static_cast<IR::ScalarReg>(source.terminator.indirect_pc_sgpr));
 		} else {
 			EXIT("block %u has no indirect branch selector", source.id);
 		}
 		ir.Emit(IR::ValueOpcode::ReferenceU32, {info.indirect_target});
 		return;
 	}
-	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
-		const auto condition = term.expression != UINT32_MAX
-		                           ? expression(expression, term.expression)
-		                           : native_condition(term.condition);
-		info.condition = condition;
-		ir.Emit(IR::ValueOpcode::Reference, {condition});
+	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
+		return;
 	}
+	IR::U1 condition;
+	switch (source.terminator.condition) {
+		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
+		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
+		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
+		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetVcc())); break;
+		case CFG::BranchCondition::VccNonZero: condition = ir.AnyLane(ir.GetVcc()); break;
+		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetExec())); break;
+		case CFG::BranchCondition::ExecNonZero: condition = ir.AnyLane(ir.GetExec()); break;
+		case CFG::BranchCondition::ScalarInstruction:
+			EXIT_IF(instruction_branch_condition.IsEmpty());
+			condition = instruction_branch_condition;
+			break;
+		case CFG::BranchCondition::GotoVariable:
+			if (source.terminator.goto_variable == UINT32_MAX) {
+				EXIT("block %u reads an invalid goto variable", source.id);
+			}
+			condition = ir.GetGotoVariable(source.terminator.goto_variable);
+			break;
+		case CFG::BranchCondition::Unknown:
+			EXIT("block %u has an unknown branch condition", source.id);
+	}
+	info.condition = condition;
+	ir.Emit(IR::ValueOpcode::Reference, {condition});
 }
 
 namespace {
@@ -829,6 +797,15 @@ const EmbeddedFetchLoad* FindEmbeddedFetchLoad(const EmbeddedFetchPlan* plan, ui
 	}
 	const auto found = std::ranges::find(plan->loads, pc, &EmbeddedFetchLoad::pc);
 	return found != plan->loads.end() ? &*found : nullptr;
+}
+
+bool IsEmbeddedFetchPrologLoad(const EmbeddedFetchPlan* plan, uint32_t pc) {
+	if (plan == nullptr) {
+		return false;
+	}
+	return std::ranges::any_of(plan->loads, [pc](const auto& load) {
+		return std::ranges::find(load.prolog_loads, pc) != load.prolog_loads.end();
+	});
 }
 
 int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo& input,
@@ -850,6 +827,22 @@ int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo& input,
 		}
 	}
 	return -1;
+}
+
+bool IsScalarMemoryLoad(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return true;
+		default: return false;
+	}
 }
 
 bool IsBufferDwordLoad(Decoder::Opcode opcode) {
@@ -886,16 +879,6 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	include_vector(inst.src1);
 	include_vector(inst.src2);
 	include_vector(inst.src3);
-	switch (inst.opcode) {
-		case Decoder::Opcode::V_CVT_F64_I32:
-		case Decoder::Opcode::V_CVT_F64_F32:
-		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
-		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
-		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
-		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
-		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
-		default: break;
-	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_WRITE_B64:
@@ -925,15 +908,8 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	if (options.wave_size != 32u && options.wave_size != 64u) {
 		EXIT("shader translation requires wave32 or wave64, got %u", options.wave_size);
 	}
-	if (options.embedded_fetch != nullptr && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Local) {
-		EXIT("embedded fetch requires a vertex or local shader");
-	}
 	switch (options.stage) {
 		case ShaderType::Vertex:
-		case ShaderType::Local:
-		case ShaderType::TessellationControl:
-		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh:
 			if (options.vertex == nullptr) {
 				EXIT("vertex shader translation has no vertex input metadata");
@@ -970,27 +946,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
-	switch (options.stage) {
-		case ShaderType::Vertex:
-		case ShaderType::Local:
-		case ShaderType::TessellationControl:
-		case ShaderType::TessellationEvaluation:
-			result.scratch_dwords = options.input_info.vertex->scratch_size_dwords;
-			break;
-		case ShaderType::Mesh:
-			result.scratch_dwords = options.input_info.vertex->mesh.scratch_size_dwords;
-			break;
-		case ShaderType::Pixel:
-			result.scratch_dwords = options.input_info.pixel->scratch_size_dwords;
-			break;
-		case ShaderType::Compute:
-			result.scratch_dwords = options.input_info.compute->scratch_size_dwords;
-			break;
-		default: break; // ValidateTranslateOptions rejects unsupported stages.
-	}
-	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
-	result.cfg_failure_kind    = cfg.failure_kind;
-	result.fallback_reason     = cfg.unsupported_reason;
+	result.scratch_dwords      = options.scratch_dwords;
+	result.dispatcher_fallback = options.dispatcher_fallback;
+	result.cfg_failure_kind    = options.cfg_failure_kind;
+	result.fallback_reason     = options.fallback_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
@@ -1122,9 +1081,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                       first_bit));
 			}
 		} else if (options.stage == ShaderType::Mesh) {
-			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
-			                     total_threads > 15u * options.wave_size);
+			const auto& mesh = options.vertex->mesh;
+			EXIT_NOT_IMPLEMENTED(options.wave_size != 64u || mesh.primitives_per_group == 0u ||
+			                     mesh.vertices_per_group > 64u || total_threads > 15u * 64u);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
 				return IR::U32(
@@ -1149,46 +1108,37 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
 			                                       {subtract_saturate(vertices, size), step})),
 			                  u32(1)));
-			const auto wave = entry_ir.ShiftRightLogical(local, u32(options.wave_size == 32u ? 5u : 6u));
-			const auto wave_base = entry_ir.BitwiseAnd(local, u32(~(options.wave_size - 1u)));
-			const auto vertex_count =
-			    minimum(subtract_saturate(vertices, wave_base), u32(options.wave_size));
-			const auto primitive_count =
-			    minimum(subtract_saturate(primitives, wave_base), u32(options.wave_size));
+			const auto wave            = entry_ir.ShiftRightLogical(local, u32(6));
+			const auto wave_base       = entry_ir.BitwiseAnd(local, u32(~63u));
+			const auto vertex_count    = minimum(subtract_saturate(vertices, wave_base), u32(64));
+			const auto primitive_count = minimum(subtract_saturate(primitives, wave_base), u32(64));
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
-			                                          u32(((total_threads + options.wave_size - 1u) /
-			                                               options.wave_size) << 28u));
+			                                          u32(((total_threads + 63u) / 64u) << 28u));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
-			// center in every subgroup; strip winding follows the global primitive.
+			// GS adjacency addresses local ES records in LDS. Strip winding alternates
+			// with the global primitive number, including across subgroup boundaries.
+			const auto parity = mesh.input_primitive ==
+			                            static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
+			                        ? entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1))
+			                        : u32(0);
 			const auto vertex = entry_ir.IMul(local, step);
-			auto       first  = vertex;
-			auto       second = u32(0);
-			auto       third  = u32(0);
-			if (mesh.InputPrimitiveSize() >= 2u) {
-				second = entry_ir.IAdd(vertex, u32(1));
-			}
-			if (mesh.InputPrimitiveSize() == 3u) {
-				third = entry_ir.IAdd(vertex, u32(2));
-			}
-			auto input_vertex = entry_ir.IAdd(chunk, local);
-			if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
-				first = u32(0);
-				input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
-			} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
-				const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
-				first = entry_ir.IAdd(first, parity);
-				second = entry_ir.ISub(second, parity);
-			}
+			const auto first  = entry_ir.IAdd(vertex, parity);
+			const auto second = mesh.InputPrimitiveSize() >= 2u
+			                        ? entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity)
+			                        : u32(0);
+			const auto third = mesh.InputPrimitiveSize() == 3u
+			                       ? entry_ir.IAdd(vertex, u32(2))
+			                       : u32(0);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
 			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
 			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 			                      entry_ir.ShiftLeftLogical(third, u32(2)));
+			const auto input_vertex = entry_ir.IAdd(chunk, local);
 			const auto index_bytes  = draw(3);
 			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 			const auto index_low    = draw(4);
@@ -1213,53 +1163,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetVectorReg(
 			    static_cast<IR::VectorReg>(8),
 			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
-		} else if (options.stage == ShaderType::Local) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
-			                      builtin(IR::StageInputKind::VertexIndex));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::InstanceIndex));
-		} else if (options.stage == ShaderType::TessellationControl) {
-			const auto& tess = options.input_info.vertex->tess;
-			entry_ir.SetScalarReg(
-			    static_cast<IR::ScalarReg>(2),
-			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));
-			entry_ir.SetScalarReg(
-			    static_cast<IR::ScalarReg>(4),
-			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(1u)})));
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value(0x81010000u | tess.input_control_points |
-			                                        (tess.output_control_points << 8u))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
-			                      builtin(IR::StageInputKind::PrimitiveId));
-			entry_ir.SetVectorReg(
-			    static_cast<IR::VectorReg>(1),
-			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
-			                              IR::U32(IR::Value(8u))));
-		} else if (options.stage == ShaderType::TessellationEvaluation) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
-			entry_ir.SetScalarReg(
-			    static_cast<IR::ScalarReg>(4),
-			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::TessCoord, 0));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
-			                      builtin(IR::StageInputKind::TessCoord, 1));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(7), IR::U32(IR::Value(0u)));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      builtin(IR::StageInputKind::PrimitiveId));
 		} else if (options.stage == ShaderType::Pixel) {
-			const auto* ps = options.input_info.pixel;
-			const auto barycentric_pair = [&](uint32_t reg, IR::StageInputKind kind) {
-				if (reg != UINT32_MAX) {
-					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg), builtin(kind, 0));
-					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg + 1u), builtin(kind, 1));
-				}
-			};
-			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
-			barycentric_pair(ps->ps_perspective_centroid_vgpr,
-			                 IR::StageInputKind::BaryCoordSmoothCentroid);
+			const auto* ps = options.pixel;
+			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr),
+				                      builtin(IR::StageInputKind::BaryCoordSmooth, 0));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr + 1u),
+				    builtin(IR::StageInputKind::BaryCoordSmooth, 1));
+			}
 			uint32_t reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
@@ -1288,26 +1200,22 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
-			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
-			                      IR::U32(IR::Value(options.wave_size << 12u)));
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
-	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
-	                             (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		Translator translator(result, result.blocks[typed_index], vector_limit);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
+				continue;
+			}
+			if (IsScalarMemoryLoad(instruction.opcode) &&
+			    IsEmbeddedFetchPrologLoad(options.embedded_fetch, instruction.pc)) {
 				continue;
 			}
 			const auto* embedded = FindEmbeddedFetchLoad(options.embedded_fetch, instruction.pc);
@@ -1329,7 +1237,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			translator.TranslateInstruction(instruction);
 		}
-		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
+		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 	}
 	IR::ValidateProgram(result, false);
 	return result;

@@ -7,7 +7,6 @@
 #include <memory>
 
 union SDL_Event;
-struct SDL_Window;
 
 namespace Libs::Graphics {
 
@@ -18,7 +17,7 @@ struct SystemOverlayVisualState {
 	uint64_t revision;
 };
 
-void                     InitializeSystemOverlayInput(SDL_Window* window);
+void                     InitializeSystemOverlayInput();
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;

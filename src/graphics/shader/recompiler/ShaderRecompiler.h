@@ -30,7 +30,6 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
-	bool        skip_dispatch = false;
 };
 
 struct CompileResult {

@@ -18,19 +18,6 @@ extern "C" {
 
 namespace Libs::Audio::Ajm {
 
-inline int AjmAt9InitDecoder(void* handle, const uint8_t* config_data) {
-	// Keep the guest configuration unchanged for metadata and decoder resets.
-	uint8_t config[ATRAC9_CONFIG_DATA_SIZE];
-	std::memcpy(config, config_data, sizeof(config));
-	const auto channel_config = (config[1] >> 1u) & 7u;
-	if (channel_config >= 6u) {
-		// LibAtrac9 lacks vibration layouts; their blocks match ordinary mono/dual-mono.
-		// Translate only the channel field, preserving the other configuration bits.
-		config[1] -= 6u << 1u;
-	}
-	return Atrac9InitDecoder(handle, config);
-}
-
 struct AjmDecAt9InitializeParameters {
 	uint8_t  config_data[ATRAC9_CONFIG_DATA_SIZE];
 	uint32_t reserved;
@@ -291,7 +278,7 @@ private:
 		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
 
-		const int init_ret = AjmAt9InitDecoder(m_handle, m_config_data);
+		const int init_ret = Atrac9InitDecoder(m_handle, m_config_data);
 		if (init_ret != 0) {
 			m_is_initialized        = false;
 			result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
@@ -477,14 +464,6 @@ private:
 			const auto* chunk      = input + offset;
 			const auto  chunk_size = static_cast<size_t>(AjmReadLe32(chunk + 4));
 			const auto  payload    = offset + 8;
-			// The data chunk describes the whole stream; this job may contain only its prefix.
-			if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
-				*data_offset                  = payload;
-				result->input_consumed        = payload;
-				result->format                = GetFormat();
-				result->total_decoded_samples = m_total_decoded_samples;
-				return true;
-			}
 			if (payload > input_size || chunk_size > input_size - payload) {
 				result->result = AJM_RESULT_PARTIAL_INPUT;
 				return false;
@@ -517,6 +496,12 @@ private:
 					LOGF("AJM ATRAC9 gapless: total=%" PRIu32 ", skip=%" PRIu16 "\n",
 					     gapless_decode.total_samples, gapless_decode.skip_samples);
 				}
+			} else if (AjmFourCcEquals(chunk, 'd', 'a', 't', 'a')) {
+				*data_offset                  = payload;
+				result->input_consumed        = payload;
+				result->format                = GetFormat();
+				result->total_decoded_samples = m_total_decoded_samples;
+				return true;
 			}
 
 			const auto padded_size = chunk_size + (chunk_size & 1u);

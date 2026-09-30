@@ -1,14 +1,15 @@
 #ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 
-#include <SDL3/SDL.h>
-
+#include "SDL_events.h"
+#include "SDL_video.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -47,6 +48,9 @@ struct WindowContext {
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);
 	void Run();
+	// SDL window operations must complete on the main thread.
+	void RunOnMainThread(std::function<void()> task);
+	void DrainMainThreadTasks();
 
 	GraphicContext                 graphic_ctx;
 	SDL_Window*                    window        = nullptr;
@@ -57,6 +61,12 @@ struct WindowContext {
 	WindowLoopState                loop;
 
 	Common::Mutex mutex;
+
+	Common::Mutex                      main_task_mutex;
+	Common::CondVar                    main_task_done;
+	std::vector<std::function<void()>> main_tasks;            // guarded by main_task_mutex
+	uint64_t                           main_tasks_queued = 0; // guarded by main_task_mutex
+	uint64_t                           main_tasks_run    = 0; // guarded by main_task_mutex
 };
 
 } // namespace Libs::Graphics

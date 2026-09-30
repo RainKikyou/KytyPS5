@@ -6,7 +6,6 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
-#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -307,7 +306,6 @@ LIB_NAME("SaveDataDialog", "SaveDataDialog");
 
 constexpr int SAVE_STATUS_NONE        = 0;
 constexpr int SAVE_STATUS_INITIALIZED = 1;
-constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
 constexpr int SAVE_RESULT_OK          = 0;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
@@ -353,20 +351,18 @@ struct SaveDataDialogResult {
 	uint8_t  reserved[32];
 };
 
-static std::atomic<int> g_save_status         = SAVE_STATUS_NONE;
-static bool             g_save_running_polled = false;
-static int              g_save_mode           = 0;
-static void*            g_save_user_data      = nullptr;
-static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+static int   g_save_status    = SAVE_STATUS_NONE;
+static int   g_save_mode      = 0;
+static void* g_save_user_data = nullptr;
+static char  g_save_dir_name[sizeof(SaveDataDirName::data)] {};
 
 int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	PRINT_NAME();
 
-	g_save_status         = SAVE_STATUS_INITIALIZED;
-	g_save_running_polled = false;
-	g_save_mode           = 0;
-	g_save_user_data      = nullptr;
-	g_save_dir_name[0]    = '\0';
+	g_save_status      = SAVE_STATUS_INITIALIZED;
+	g_save_mode        = 0;
+	g_save_user_data   = nullptr;
+	g_save_dir_name[0] = '\0';
 
 	return OK;
 }
@@ -379,14 +375,6 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
-
-	// Some games require a RUNNING update before FINISHED.
-	if (g_save_status == SAVE_STATUS_RUNNING) {
-		if (g_save_running_polled) {
-			g_save_status = SAVE_STATUS_FINISHED;
-		}
-		g_save_running_polled = true;
-	}
 
 	return g_save_status;
 }
@@ -443,8 +431,7 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		}
 	}
 
-	g_save_status         = SAVE_STATUS_RUNNING;
-	g_save_running_polled = false;
+	g_save_status = SAVE_STATUS_FINISHED;
 
 	return OK;
 }
@@ -454,8 +441,7 @@ int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 
 	LOGF("\t close_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(close_param));
 
-	g_save_status         = SAVE_STATUS_FINISHED;
-	g_save_running_polled = false;
+	g_save_status = SAVE_STATUS_FINISHED;
 
 	return OK;
 }
@@ -469,11 +455,10 @@ int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
 int KYTY_SYSV_ABI SaveDataDialogTerminate() {
 	PRINT_NAME();
 
-	g_save_status         = SAVE_STATUS_NONE;
-	g_save_running_polled = false;
-	g_save_mode           = 0;
-	g_save_user_data      = nullptr;
-	g_save_dir_name[0]    = '\0';
+	g_save_status      = SAVE_STATUS_NONE;
+	g_save_mode        = 0;
+	g_save_user_data   = nullptr;
+	g_save_dir_name[0] = '\0';
 
 	return 0;
 }

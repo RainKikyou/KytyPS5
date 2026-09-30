@@ -262,25 +262,35 @@ struct CommandBuffer {
 		     reserved_dw);
 	}
 
-	[[nodiscard]] KYTY_SYSV_ABI uint64_t GetAvailableSizeDW() const {
-		// Interpret the signed cursor distance as an unsigned 64-bit DWORD count.
-		const auto distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor_down) -
-		                                           reinterpret_cast<uintptr_t>(cursor_up));
-		const auto available = static_cast<uint64_t>(distance >> 2);
+	[[nodiscard]] KYTY_SYSV_ABI uint32_t GetAvailableSizeDW() const {
+		if (cursor_up == nullptr || cursor_down == nullptr || cursor_down <= cursor_up) {
+			return 0;
+		}
+
+		auto available = static_cast<uint64_t>(cursor_down - cursor_up);
 		if (available <= reserved_dw) {
 			return 0;
 		}
-		return available - reserved_dw;
+		if (available - reserved_dw > UINT32_MAX) {
+			LOGF_COLOR(
+			    Log::Color::Red,
+			    "\t command buffer has suspiciously large free space: cursor_up = 0x%016" PRIx64
+			    ", cursor_down = 0x%016" PRIx64 ", reserved_dw = %" PRIu32 "\n",
+			    reinterpret_cast<uint64_t>(cursor_up), reinterpret_cast<uint64_t>(cursor_down),
+			    reserved_dw);
+			return UINT32_MAX;
+		}
+		return static_cast<uint32_t>(available - reserved_dw);
 	}
 
 	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
-		const uint64_t remaining = GetAvailableSizeDW();
+		uint32_t remaining = GetAvailableSizeDW();
 		if (num_dw > remaining) {
 			if (callback == nullptr) {
 				LOGF_COLOR(
 				    Log::Color::Red,
 				    "\t command buffer exhausted and has no grow callback: requested = %" PRIu32
-				    ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
+				    ", remaining = %" PRIu32 ", reserved_dw = %" PRIu32 "\n",
 				    num_dw, remaining, reserved_dw);
 				DbgDump();
 				return false;
@@ -290,7 +300,7 @@ struct CommandBuffer {
 			if (!result) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback failed: requested = %" PRIu32
-				           ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
+				           ", remaining = %" PRIu32 ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, remaining, reserved_dw);
 				DbgDump();
 				return false;
@@ -298,7 +308,7 @@ struct CommandBuffer {
 			if (GetAvailableSizeDW() < num_dw) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback did not provide enough space: "
-				           "requested = %" PRIu32 ", remaining = %" PRIu64
+				           "requested = %" PRIu32 ", remaining = %" PRIu32
 				           ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, GetAvailableSizeDW(), reserved_dw);
 				DbgDump();
@@ -2110,7 +2120,7 @@ uint32_t KYTY_SYSV_ABI AgcCbQueueEndOfPipeActionGetSize() {
 uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 	PRINT_NAME();
 
-	AgcTrace("\t op    = 0x%08" PRIx32 "\n", op);
+	LOGF("\t op    = 0x%08" PRIx32 "\n", op);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0x1c2u) != 0);
@@ -2130,9 +2140,9 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state) {
 	PRINT_NAME();
 
-	AgcTrace("\t op    = 0x%08" PRIx32 "\n"
-	         "\t state = 0x%08" PRIx32 "\n",
-	         op, state);
+	LOGF("\t op    = 0x%08" PRIx32 "\n"
+	     "\t state = 0x%08" PRIx32 "\n",
+	     op, state);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0xfffu) != 0);
@@ -2749,9 +2759,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
                                                   const volatile void* indirect_base_addr) {
 	PRINT_NAME();
 
-	AgcTrace("\t shader_type        = %" PRIu32 "\n"
-	         "\t indirect_base_addr = 0x%016" PRIx64 "\n",
-	         shader_type, reinterpret_cast<uint64_t>(indirect_base_addr));
+	LOGF("\t shader_type        = %" PRIu32 "\n"
+	     "\t indirect_base_addr = 0x%016" PRIx64 "\n",
+	     shader_type, reinterpret_cast<uint64_t>(indirect_base_addr));
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2941,9 +2951,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
                                                uint32_t flags) {
 	PRINT_NAME();
 
-	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
-	         "\t flags       = 0x%08" PRIx32 "\n",
-	         data_offset_in_bytes, flags);
+	LOGF("\t data_offset = 0x%" PRIx32 "\n"
+	     "\t flags       = 0x%08" PRIx32 "\n",
+	     data_offset_in_bytes, flags);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -3294,9 +3304,9 @@ uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
                                                uint32_t             modifier) {
 	PRINT_NAME();
 
-	AgcTrace("\t indirect_args = 0x%016" PRIx64 "\n"
-	         "\t modifier      = 0x%08" PRIx32 "\n",
-	         reinterpret_cast<uint64_t>(indirect_args), modifier);
+	LOGF("\t indirect_args = 0x%016" PRIx64 "\n"
+	     "\t modifier      = 0x%08" PRIx32 "\n",
+	     reinterpret_cast<uint64_t>(indirect_args), modifier);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3724,9 +3734,9 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd
                                                     const volatile uint32_t* command) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd     = 0x%016" PRIx64 "\n"
-	         "\t command = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
+	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
+	     "\t command = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
 
 	if (cmd == nullptr || command == nullptr) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
@@ -3868,9 +3878,9 @@ static uint32_t* get_agc_wait_packet(uint32_t* cmd) {
 int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd     = 0x%016" PRIx64 "\n"
-	         "\t address = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
+	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
+	     "\t address = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
@@ -3913,9 +3923,9 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 
 	// Not sure
 
-	AgcTrace("\t cmd     = 0x%016" PRIx64 "\n"
-	         "\t address = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
+	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
+	     "\t address = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -4246,7 +4256,7 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	}
 
 	for (uint32_t i = 0; i < std::min<uint32_t>(size_in_dwords, 8); i++) {
-		AgcTrace("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
+		LOGF("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
 	}
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
@@ -4322,17 +4332,17 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
 int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 	PRINT_NAME();
 
-	AgcTrace("\t queue  = 0x%08" PRIx32 "\n"
-	         "\t packet = 0x%016" PRIx64 "\n",
-	         queue, reinterpret_cast<uint64_t>(packet));
+	LOGF("\t queue  = 0x%08" PRIx32 "\n"
+	     "\t packet = 0x%016" PRIx64 "\n",
+	     queue, reinterpret_cast<uint64_t>(packet));
 
 	if (packet == nullptr) {
 		return OK;
 	}
-	AgcTrace("\t acb   = 0x%016" PRIx64 "\n"
-	         "\t size  = 0x%08" PRIx32 "\n"
-	         "\t flags = 0x%02" PRIx8 "\n",
-	         reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+	LOGF("\t acb   = 0x%016" PRIx64 "\n"
+	     "\t size  = 0x%08" PRIx32 "\n"
+	     "\t flags = 0x%02" PRIx8 "\n",
+	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
 	submit_acb(queue, packet->addr, packet->dw_num);
 	return OK;

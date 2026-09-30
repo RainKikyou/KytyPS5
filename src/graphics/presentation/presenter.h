@@ -4,7 +4,6 @@
 #include "common/common.h"
 
 #include <memory>
-#include <span>
 
 namespace Libs::Graphics {
 
@@ -16,11 +15,6 @@ struct WindowContext;
 class Presenter final {
 public:
 	struct Frame;
-	struct Layer {
-		Frame* frame;
-		int    bus;
-		bool   premultiplied_alpha;
-	};
 
 	explicit Presenter(WindowContext& window);
 	~Presenter();
@@ -29,13 +23,11 @@ public:
 	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info);
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
-	[[nodiscard]] bool           PresentLastFrame();
+	[[nodiscard]] Frame*         PrepareLastFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
-	void                         Present(Frame& frame);
-	void                         Present(std::span<const Layer> layers);
-	void                         ClearLayer(int bus);
+	void                         Present(Frame& frame, bool reuse = false);
 	void                         Discard(Frame& frame);
 
 private:
