@@ -31,7 +31,7 @@ constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-static void SleepHighResolution100ns(uint64_t units_100ns, bool allow_spinning = true) {
+static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
 	}
@@ -232,16 +232,6 @@ void Thread::SleepNano(uint64_t nanos) {
 	SleepHighResolutionNanos(nanos);
 #else
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
-#endif
-}
-
-void Thread::SleepMicroWithoutSpinning(uint32_t micros) {
-#ifdef KYTY_WIN_CS
-	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10, false);
-#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
-	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000, false);
-#else
-	std::this_thread::sleep_for(std::chrono::microseconds(micros));
 #endif
 }
 
