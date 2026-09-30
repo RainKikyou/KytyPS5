@@ -533,6 +533,12 @@ add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
+add_executable(save_data_capacity_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataCapacityTests.cpp")
+target_include_directories(save_data_capacity_tests PRIVATE ${inc_headers})
+add_kyty_full_emulator_test(fiber_migration_tests
+	"${KYTY_TESTS_DIR}/FiberMigrationTests.cpp")
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
