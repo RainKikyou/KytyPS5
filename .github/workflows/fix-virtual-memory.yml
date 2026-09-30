@@ -1,0 +1,62 @@
+name: Fix virtual memory files
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: demo-merge-pr500-pr599
+          fetch-depth: 0
+
+      - name: Restore and fix files
+        run: |
+          git checkout a945ee99 -- src/common/platform/sysLinuxVirtual.cpp src/common/platform/sysWindowsVirtual.cpp
+          
+          sed -i '/#include "common\/assert.h"/a #include "common/pageProtectionTable.h"' src/common/platform/sysLinuxVirtual.cpp
+          
+          python3 -c "
+          import re
+          with open('src/common/platform/sysLinuxVirtual.cpp') as f: c = f.read()
+          new = 'bool Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nullptr) {\n'
+          new += '\tconst auto addr       = static_cast<uintptr_t>(address);\n'
+          new += '\tconst auto page_start = addr >> 12u;\n'
+          new += '\tconst auto page_end   = (addr + size - 1) >> 12u;\n'
+          new += '\tpthread_mutex_lock(&g_virtual_mutex);\n'
+          new += '\tif (old_mode != nullptr) {\n'
+          new += '\t\t*old_mode = get_protection_flag(g_protects->Get(addr >> 12u));\n'
+          new += '\t}\n'
+          new += '\tpthread_mutex_unlock(&g_virtual_mutex);\n'
+          new += '\tif (mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,\n'
+          new += '\t             get_protection_flag(mode)) == 0) {\n'
+          new += '\t\tpthread_mutex_lock(&g_virtual_mutex);\n'
+          new += '\t\tg_protects->Set(page_start, page_end, static_cast<uint8_t>(get_protection_flag(mode)));\n'
+          new += '\t\tpthread_mutex_unlock(&g_virtual_mutex);\n'
+          new += '\t\treturn true;\n'
+          new += '\t}\n'
+          new += '\treturn false;\n'
+          new += '}'
+          c = re.sub(r'bool Protect\(uint64_t address, uint64_t size, Mode mode\) \{.*?\}', lambda m: new, c, flags=re.DOTALL)
+          with open('src/common/platform/sysLinuxVirtual.cpp', 'w') as f: f.write(c)
+          "
+          
+          python3 -c "
+          with open('src/common/platform/sysWindowsVirtual.cpp') as f: c = f.read()
+          old = '\treturn protect;\n}\n\nvoid Init() {}'
+          new = '\treturn protect;\n}\n\nstatic Mode GetProtectionFlag(DWORD mode) {\n\tswitch (mode) {\n\t\tcase PAGE_NOACCESS: return Mode::NoAccess;\n\t\tcase PAGE_READONLY: return Mode::Read;\n\t\tcase PAGE_READWRITE: return Mode::ReadWrite;\n\t\tcase PAGE_EXECUTE: return Mode::Execute;\n\t\tcase PAGE_EXECUTE_READ: return Mode::ExecuteRead;\n\t\tcase PAGE_EXECUTE_READWRITE: return Mode::ExecuteReadWrite;\n\t\tdefault: return Mode::NoAccess;\n\t}\n}\n\nvoid Init() {}'
+          c = c.replace(old, new)
+          c = c.replace('bool Protect(uint64_t address, uint64_t size, Mode mode) {', 'bool Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode = nullptr) {')
+          with open('src/common/platform/sysWindowsVirtual.cpp', 'w') as f: f.write(c)
+          "
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --stat
+          git commit -m "fix: restore virtual memory implementation after upstream merge"
+          git push
