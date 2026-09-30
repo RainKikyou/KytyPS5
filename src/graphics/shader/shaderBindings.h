@@ -170,15 +170,10 @@ struct ShaderSamplerResource {
 };
 
 struct ShaderVertexInputBuffer {
-	static constexpr int ATTR_MAX = 32;
-
-	uint64_t addr                   = 0;
-	uint32_t stride                 = 0;
-	uint32_t num_records            = 0;
-	uint32_t fetch_index            = 0;
-	int      attr_num               = 0;
-	int      attr_indices[ATTR_MAX] = {0};
-	uint32_t attr_offsets[ATTR_MAX] = {0};
+	uint64_t addr        = 0;
+	uint32_t stride      = 0;
+	uint32_t num_records = 0;
+	uint32_t fetch_index = 0;
 };
 
 struct ShaderVertexDestination {
@@ -186,6 +181,7 @@ struct ShaderVertexDestination {
 	int      registers_num  = 0;
 	int      attr_id        = -1;
 	uint32_t fetch_index    = 0;
+	int      buffer_index   = 0;
 };
 
 enum class ShaderStorageUsage {

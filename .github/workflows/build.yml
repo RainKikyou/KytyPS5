@@ -6,7 +6,12 @@ on:
     branches: [ main, master ]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
+  SCCACHE_GHA_ENABLED: "true"
   KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
@@ -37,9 +42,6 @@ jobs:
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
 
       - name: Locate vcpkg
         id: vcpkg
@@ -78,6 +80,9 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: cmd
         run: |
@@ -100,17 +105,23 @@ jobs:
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests --parallel
+          cmake --build _Build/windows --target launcher ^
+            audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            shader_recompiler_compute_tests ^
+            resource_tracking_tests scalar_provenance_tests ^
+            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -145,7 +156,7 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
-        run: brew install glslang ninja
+        run: brew install glslang
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -155,6 +166,9 @@ jobs:
           target: desktop
           arch: clang_64
           cache: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -180,20 +194,25 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -302,8 +321,9 @@ jobs:
             libxkbcommon-dev \
             libxrandr-dev \
             libxss-dev \
+            libxtst-dev \
             lld \
-            ninja-build \
+            pkg-config \
             wayland-protocols
 
       - name: Install Qt 6.10.3
@@ -314,6 +334,9 @@ jobs:
           target: desktop
           arch: linux_gcc_64
           cache: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -339,10 +362,12 @@ jobs:
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Verify SDL2 backends
+      - name: Verify SDL3 backends
         shell: bash
         run: |
           status=0
@@ -361,14 +386,16 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash

@@ -3,6 +3,7 @@
 #include "configuration.h"
 
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
@@ -18,7 +19,7 @@
 PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
     : QDialog(parent), m_title_id(game.title_id.trimmed().toUpper()) {
 	setAttribute(Qt::WA_DeleteOnClose);
-	setWindowTitle(tr("Cheats (Experimental) - %1").arg(game.name));
+	setWindowTitle(tr("Cheats (experimental) - %1").arg(game.name));
 	resize(640, 480);
 
 	auto* layout = new QVBoxLayout(this);
@@ -129,8 +130,11 @@ void PatchesDialog::Save() {
 	document.setObject(root);
 
 	QSaveFile output(path);
-	if (output.open(QIODevice::WriteOnly) && output.write(document.toJson()) >= 0 &&
-	    output.commit()) {
-		m_status->setText(tr("Cheat selection saved."));
+	if (!output.open(QIODevice::WriteOnly) || output.write(document.toJson()) < 0 ||
+	    !output.commit()) {
+		qWarning() << "Could not save cheat file:" << output.errorString();
+		m_status->setText(tr("Could not save cheat file: %1").arg(output.errorString()));
+		return;
 	}
+	m_status->setText(tr("Cheat selection saved."));
 }

@@ -15,6 +15,7 @@
 
 #include <array>
 #include <bit>
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@ enum class ResourceKind {
 	ScalarBuffer,
 	ScalarAddress,
 	Buffer,
+	IndirectBuffer,
 	Flat,
 	Global,
 	Scratch,
@@ -71,7 +73,14 @@ struct MemoryInfo {
 	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
+	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+
+	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
+		        opcode == ValueOpcode::LoadBufferU32x4);
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -145,6 +154,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	bool     integer_border        = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -157,8 +167,20 @@ struct SampledResourcePair {
 	bool operator==(const SampledResourcePair& other) const = default;
 };
 
+enum class TessellationAttribute {
+	LocalOutput,
+	ControlInput,
+	ControlOutput,
+	EvaluationInput,
+	PatchOutput,
+	Factor
+};
+
 enum class StageInputKind {
 	VertexIndex,
+	InvocationId,
+	PrimitiveId,
+	TessCoord,
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
@@ -166,6 +188,7 @@ enum class StageInputKind {
 	Layer,
 	SampleId,
 	BaryCoordSmooth,
+	BaryCoordSmoothCentroid,
 	BaryCoordNoPerspective,
 	WorkgroupId,
 	LocalInvocationId,
@@ -295,8 +318,12 @@ static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
+	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
+	                       : stage == ShaderType::TessellationControl    ? 2u
+	                       : stage == ShaderType::TessellationEvaluation ? 3u
+	                                                                     : 0u;
 	return static_cast<uint32_t>(kind) +
-	       (stage == ShaderType::Pixel ? static_cast<uint32_t>(DescriptorBindingKind::Count) : 0u);
+	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
@@ -421,7 +448,7 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
+	static constexpr uint32_t MaxBuffers      = 64;
 	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
@@ -464,18 +491,13 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectImage {
-		uint32_t material_source = 0;
-		uint32_t heap_source     = 0;
+		uint32_t material_source = UINT32_MAX;
+		uint32_t table_source    = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
-		uint32_t key_arg         = 0;
-		uint32_t table_offset = 0;
-		uint32_t key_bound    = 0;
-		static constexpr uint32_t NoBoundSource = UINT32_MAX;
-		uint32_t                  bound_source  = NoBoundSource;
-		bool                      bound_signed  = false;
-		uint32_t item_bound = 0;
-		uint32_t selector_immediate = 0;
+		uint32_t table_offset    = 0;
+		Value    key_count;
+		Value    selector_mask;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
@@ -520,10 +542,19 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
-// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
-// uniform condition and fill values without retaining translated blocks.
-struct LinearSrtPlan;
+// Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
+// condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	struct EvaluationContext {
+		struct Entry {
+			uint64_t value      = 0;
+			uint64_t generation = 0;
+		};
+
+		std::vector<Entry> values;
+		uint64_t           generation = 0;
+	};
+
 	ResourcePlan() = default;
 	~ResourcePlan();
 
@@ -541,14 +572,23 @@ struct ResourcePlan {
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
-	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
+	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
+	mutable std::deque<EvaluationContext> evaluation_contexts;
+	mutable uint32_t                       evaluation_value_count = 0;
+	mutable uint32_t                       evaluation_depth       = 0;
+	mutable std::vector<uint8_t>            active_sources;
+	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint32_t>           pending_blocks;
+	mutable std::vector<uint32_t>           material_keys;
+	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
 struct Program: ResourcePlan {
@@ -569,11 +609,12 @@ struct Program: ResourcePlan {
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
-	// Decoded MIMG/VMEM metadata carries details such as RDNA2 NSA address registers and
-	// storage-image swizzles. Typed memory instructions carry a dense index into these shader-local
-	// tables until those fields are consumed by emission.
+	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
+	std::vector<ScalarWrite>      scalar_writes;
+	// Typed memory and export instructions reference shader-local metadata by dense index.
+	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
-	std::vector<Value>            dynamic_reads;
+	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
@@ -582,6 +623,7 @@ struct Program: ResourcePlan {
 };
 
 std::string ProgramToString(const Program& program);
+bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);

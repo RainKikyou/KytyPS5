@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -52,6 +53,10 @@ uint32_t TypeI32Pair(EmitterState& state) {
 
 uint32_t TypeF32(EmitterState& state) {
 	return state.builder.Type(OpTypeFloat, {32});
+}
+
+uint32_t TypeF64(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 64);
 }
 
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
@@ -217,8 +222,81 @@ void DefineDescriptorVariables(EmitterState& state) {
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
 	for (const auto& binding: state.program.bindings.descriptors) {
-		if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::None) {
-			continue;
+		const auto Define = [&](uint32_t type, const char* name,
+		                        spv::StorageClass storage = spv::StorageClassStorageBuffer) {
+			const auto variable =
+			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+			state.builder.AddName(variable, name);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
+			                            IR::NativeBinding(state.program.stage, binding.kind));
+			return variable;
+		};
+		const auto ArrayType = [&](uint32_t type) {
+			return state.builder.Type(
+			    spv::OpTypeArray, type,
+			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
+		};
+		switch (binding.kind) {
+			case IR::DescriptorBindingKind::Buffers:
+				state.storage_buffer_variable =
+				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				if (state.requirements.buffer_int64_atomics) {
+					state.storage_buffer_u64_variable =
+					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationAliased);
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+					                            spv::DecorationAliased);
+				}
+				if (state.requirements.coherent_buffers) {
+					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
+					// must participate in visibility for cache-bypassing polling loads.
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationCoherent);
+					if (state.storage_buffer_u64_variable != 0) {
+						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+						                            spv::DecorationCoherent);
+					}
+				}
+				break;
+			case IR::DescriptorBindingKind::BdaPagetable:
+				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");
+				break;
+			case IR::DescriptorBindingKind::FaultBuffer:
+				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
+				break;
+			case IR::DescriptorBindingKind::ShaderData:
+				state.shader_data_storage_variable =
+				    Define(StorageBufferType(state), "shader_data");
+				break;
+			case IR::DescriptorBindingKind::FlattenedSrt:
+				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				break;
+			case IR::DescriptorBindingKind::Samplers:
+				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),
+				                                "samplers", spv::StorageClassUniformConstant);
+				break;
+			case IR::DescriptorBindingKind::Gds:
+				state.gds_variable = Define(StorageBufferType(state), "gds");
+				break;
+			default: {
+				EXIT_IF(IR::ImageBindingResourceClass(binding.kind) ==
+				        IR::ImageResourceClass::None);
+				const auto& image = state.program.info.images.at(binding.resources.front());
+				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
+				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
+				    Define(ArrayType(ImageType(state, image)), name.c_str(),
+				           spv::StorageClassUniformConstant);
+				if (image.dimension == ImageDimension::Dim1D ||
+				    image.dimension == ImageDimension::Dim1DArray) {
+					state.builder.RequireCapability(image.resource_class ==
+					                                        IR::ImageResourceClass::Sampled
+					                                    ? spv::CapabilitySampled1D
+					                                    : spv::CapabilityImage1D);
+				}
+				break;
+			}
 		}
 		const auto& image        = state.program.info.images.at(binding.resources.front());
 		const auto  count        = ConstantU32(state, DescriptorCount(state, binding.kind));
@@ -279,14 +357,8 @@ uint32_t ConstantF32(EmitterState& state, uint32_t bits) {
 	return state.builder.Constant(OpConstant, TypeF32(state), {bits});
 }
 
-uint32_t FloatBits(float value) {
-	uint32_t bits = 0;
-	std::memcpy(&bits, &value, sizeof(bits));
-	return bits;
-}
-
 uint32_t ConstantF32Value(EmitterState& state, float value) {
-	return ConstantF32(state, FloatBits(value));
+	return ConstantF32(state, std::bit_cast<uint32_t>(value));
 }
 
 uint32_t ConstantBool(EmitterState& state, bool value) {
@@ -311,7 +383,8 @@ uint32_t GlslStd450(EmitterState& state) {
 }
 
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
-	if (state.stage != ShaderType::Vertex || location >= ShaderVertexInputInfo::RES_MAX ||
+	if ((state.program.stage != ShaderType::Vertex && state.program.stage != ShaderType::Local) ||
+	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
 		return VertexInputScalarKind::Float;
 	}
@@ -354,31 +427,35 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 	}
 }
 
-uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
-                                         uint32_t components) {
+uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
+                                 const char* name) {
+	const auto variable =
+	    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+	state.interface_variables.push_back(variable);
+	state.builder.AddName(variable, name);
+	return variable;
+}
+
+namespace {
+
+uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
-		case VertexInputScalarKind::Sint:
-			switch (components) {
-				case 1: return TypePointer(state, StorageClassInput, TypeI32(state));
-				case 2: return TypePointer(state, StorageClassInput, TypeI32Vector(state, 2));
-				case 3: return TypePointer(state, StorageClassInput, TypeI32Vector(state, 3));
-				default: return TypePointer(state, StorageClassInput, TypeI32Vector(state, 4));
-			}
-		case VertexInputScalarKind::Uint:
-			switch (components) {
-				case 1: return TypePointer(state, StorageClassInput, TypeU32(state));
-				case 2: return TypePointer(state, StorageClassInput, TypeU32Vector(state, 2));
-				case 3: return TypePointer(state, StorageClassInput, TypeU32Vector(state, 3));
-				default: return TypePointer(state, StorageClassInput, TypeU32Vector(state, 4));
-			}
-		case VertexInputScalarKind::Float:
-		default:
-			switch (components) {
-				case 1: return TypePointer(state, StorageClassInput, TypeF32(state));
-				case 2: return TypePointer(state, StorageClassInput, TypeF32Vector(state, 2));
-				case 3: return TypePointer(state, StorageClassInput, TypeF32Vector(state, 3));
-				default: return TypePointer(state, StorageClassInput, TypeF32Vector(state, 4));
-			}
+		case IR::StageInputKind::VertexIndex: return spv::BuiltInVertexIndex;
+		case IR::StageInputKind::InvocationId: return spv::BuiltInInvocationId;
+		case IR::StageInputKind::PrimitiveId: return spv::BuiltInPrimitiveId;
+		case IR::StageInputKind::TessCoord: return spv::BuiltInTessCoord;
+		case IR::StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
+		case IR::StageInputKind::FragCoord: return spv::BuiltInFragCoord;
+		case IR::StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
+		case IR::StageInputKind::Layer: return spv::BuiltInLayer;
+		case IR::StageInputKind::SampleId: return spv::BuiltInSampleId;
+		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
+		case IR::StageInputKind::BaryCoordNoPerspective: return spv::BuiltInBaryCoordNoPerspKHR;
+		case IR::StageInputKind::WorkgroupId: return spv::BuiltInWorkgroupId;
+		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
+		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
+		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
+		default: return UINT32_MAX;
 	}
 }
 
@@ -410,71 +487,51 @@ void AllocateInputVariables(EmitterState& state) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
 	}
-	for (auto& binding: state.inputs) {
-		binding.variable_id = state.builder.AllocateId();
-		state.interface_variables.push_back(binding.variable_id);
-	}
-	if (state.requirements.subgroup_local_invocation_id) {
-		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
-		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
-	}
-}
-
-static uint32_t AllocateInterfaceVariable(EmitterState& state) {
-	const auto variable = state.builder.AllocateId();
-	state.interface_variables.push_back(variable);
-	return variable;
-}
-
-static uint32_t AllocateSharedOutputVariable(EmitterState& state, uint32_t& variable) {
-	if (variable == 0) {
-		variable = AllocateInterfaceVariable(state);
-	}
-	return variable;
-}
-
-void AllocateOutputVariables(EmitterState& state) {
-	if (state.stage == ShaderType::Mesh) {
-		DefineMeshOutputs(state);
-		return;
-	}
-	for (auto& binding: state.outputs) {
-		switch (binding.kind) {
-			case IR::StageOutputKind::Position:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.per_vertex_variable);
-				break;
-			case IR::StageOutputKind::PointSize:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.point_size_variable);
-				break;
-			case IR::StageOutputKind::ClipDistance:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.clip_distance_variable);
-				state.clip_distance_count = std::max(state.clip_distance_count, binding.index + 1);
-				break;
-			case IR::StageOutputKind::CullDistance:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.cull_distance_variable);
-				state.cull_distance_count = std::max(state.cull_distance_count, binding.index + 1);
-				break;
-			case IR::StageOutputKind::Layer:
-				binding.variable_id = AllocateSharedOutputVariable(state, state.layer_variable);
-				break;
-			case IR::StageOutputKind::ViewportIndex:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.viewport_index_variable);
-				break;
-			case IR::StageOutputKind::Depth:
-				binding.variable_id = AllocateSharedOutputVariable(state, state.depth_variable);
-				break;
-			case IR::StageOutputKind::SampleMask:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.sample_mask_variable);
-				break;
-			case IR::StageOutputKind::Parameter:
-			case IR::StageOutputKind::Mrt:
-				binding.variable_id = AllocateInterfaceVariable(state);
+	for (auto& input: state.inputs) {
+		if (state.program.stage == ShaderType::Pixel &&
+		    input.kind == IR::StageInputKind::Parameter) {
+			const auto location = PixelParameterLocation(state, input.location);
+			const auto alias = std::ranges::find_if(state.inputs, [&](const InputBinding& other) {
+				return other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&
+				       PixelParameterLocation(state, other.location) == location;
+			});
+			if (alias != state.inputs.end()) {
+				EXIT_IF(alias->per_vertex != input.per_vertex);
+				input.variable_id = alias->variable_id;
+				continue;
+			}
+		}
+		uint32_t type = TypeU32(state);
+		switch (input.kind) {
+			case IR::StageInputKind::VertexIndex:
+			case IR::StageInputKind::InvocationId:
+			case IR::StageInputKind::PrimitiveId:
+			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::Layer:
+			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
+			case IR::StageInputKind::WorkgroupId:
+			case IR::StageInputKind::LocalInvocationId:
+			case IR::StageInputKind::GlobalInvocationId: type = TypeU32Vector(state, 3); break;
+			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
+			case IR::StageInputKind::TessCoord:
+			case IR::StageInputKind::BaryCoordSmooth:
+			case IR::StageInputKind::BaryCoordNoPerspective: type = TypeF32Vector(state, 3); break;
+			case IR::StageInputKind::FrontFacing: type = TypeBool(state); break;
+			case IR::StageInputKind::Parameter:
+				if (state.program.stage == ShaderType::Vertex ||
+				    state.program.stage == ShaderType::Local) {
+					type = VertexParameterScalarType(
+					    state, VertexParameterScalarKind(state, input.location));
+					const auto components = VertexParameterComponentCount(input);
+					if (components > 1u) {
+						type = state.builder.Type(spv::OpTypeVector, type, components);
+					}
+				} else if (input.per_vertex) {
+					type = state.builder.Type(spv::OpTypeArray, TypeF32Vector(state, 4),
+					                          ConstantU32(state, 3));
+				} else {
+					type = TypeF32Vector(state, 4);
+				}
 				break;
 		}
 	}
@@ -550,37 +607,87 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 	if (state.stage == ShaderType::Mesh) {
 		return;
 	}
-	if (state.per_vertex_variable != 0) {
-		state.builder.AddName(PerVertexType(state), "gl_PerVertex");
-		state.builder.AddName(state.per_vertex_variable, "outPerVertex");
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
+		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
+		state.invalid_position_clip_distance = clip_distance_count++;
+		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
+		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
 	}
-	auto AddBuiltIn = [&](uint32_t variable, const char* name, uint32_t builtin) {
-		if (variable != 0) {
-			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation({OpDecorate, variable, DecorationBuiltIn, builtin});
+	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
+	                         spv::BuiltIn builtin) {
+		if (variable == 0) {
+			variable = DefineInterfaceVariable(state, type, spv::StorageClassOutput, name);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
 		}
 	};
-	AddBuiltIn(state.point_size_variable, "gl_PointSize", BuiltInPointSize);
-	AddBuiltIn(state.clip_distance_variable, "gl_ClipDistance", BuiltInClipDistance);
-	AddBuiltIn(state.cull_distance_variable, "gl_CullDistance", BuiltInCullDistance);
-	AddBuiltIn(state.layer_variable, "gl_Layer", BuiltInLayer);
-	AddBuiltIn(state.viewport_index_variable, "gl_ViewportIndex", BuiltInViewportIndex);
-	if (state.depth_variable != 0) {
-		state.builder.AddName(state.depth_variable, "gl_FragDepth");
-		state.builder.AddAnnotation(
-		    {OpDecorate, state.depth_variable, DecorationBuiltIn, BuiltInFragDepth});
-	}
-	if (state.sample_mask_variable != 0) {
-		state.builder.AddName(state.sample_mask_variable, "gl_SampleMask");
-		state.builder.AddAnnotation(
-		    {OpDecorate, state.sample_mask_variable, DecorationBuiltIn, BuiltInSampleMask});
-	}
-	for (const auto& binding: state.outputs) {
-		if (binding.kind == IR::StageOutputKind::Parameter ||
-		    binding.kind == IR::StageOutputKind::Mrt) {
-			state.builder.AddName(binding.variable_id, binding.debug_name.c_str());
-			state.builder.AddAnnotation(
-			    {OpDecorate, binding.variable_id, DecorationLocation, binding.location});
+	for (auto& binding: state.outputs) {
+		switch (binding.kind) {
+			case IR::StageOutputKind::Position:
+				if (state.per_vertex_variable == 0) {
+					const auto type = PerVertexType(state);
+					state.builder.AddName(type, "gl_PerVertex");
+					state.per_vertex_variable = DefineInterfaceVariable(
+					    state, type, spv::StorageClassOutput, "outPerVertex");
+				}
+				binding.variable_id = state.per_vertex_variable;
+				break;
+			case IR::StageOutputKind::PointSize:
+				binding.variable_id = BuiltIn(state.point_size_variable, TypeF32(state),
+				                              "gl_PointSize", spv::BuiltInPointSize);
+				break;
+			case IR::StageOutputKind::ClipDistance:
+				binding.variable_id =
+				    BuiltIn(state.clip_distance_variable, F32ArrayType(state, clip_distance_count),
+				            "gl_ClipDistance", spv::BuiltInClipDistance);
+				break;
+			case IR::StageOutputKind::CullDistance:
+				binding.variable_id =
+				    BuiltIn(state.cull_distance_variable, F32ArrayType(state, cull_distance_count),
+				            "gl_CullDistance", spv::BuiltInCullDistance);
+				break;
+			case IR::StageOutputKind::Layer:
+				binding.variable_id =
+				    BuiltIn(state.layer_variable, TypeU32(state), "gl_Layer", spv::BuiltInLayer);
+				break;
+			case IR::StageOutputKind::ViewportIndex:
+				binding.variable_id = BuiltIn(state.viewport_index_variable, TypeU32(state),
+				                              "gl_ViewportIndex", spv::BuiltInViewportIndex);
+				break;
+			case IR::StageOutputKind::Depth:
+				binding.variable_id = BuiltIn(state.depth_variable, TypeF32(state), "gl_FragDepth",
+				                              spv::BuiltInFragDepth);
+				break;
+			case IR::StageOutputKind::SampleMask:
+				binding.variable_id =
+				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
+				            spv::BuiltInSampleMask);
+				break;
+			case IR::StageOutputKind::Parameter:
+			case IR::StageOutputKind::Mrt: {
+				const bool uint_output =
+				    binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel &&
+				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
+				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
+				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
+				                                              binding.debug_name.c_str());
+				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
+				                         state.program.stage == ShaderType::Pixel &&
+				                         state.input_info.pixel->dual_source_blending;
+				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+				                            spv::DecorationLocation,
+				                            dual_source ? 0u : binding.location);
+				if (dual_source) {
+					state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+					                            spv::DecorationIndex, binding.index);
+				}
+				break;
+			}
 		}
 	}
 }
@@ -654,7 +761,12 @@ void AddVsharpAnnotationsAndNames(EmitterState& state) {
 }
 
 void DefineModule(EmitterState& state) {
-	DefineDescriptorVariables(state);
+	state.interface_variables.reserve(state.program.info.inputs.size() +
+	                                  state.program.info.outputs.size());
+	DefineInputs(state);
+	DefineOutputs(state);
+	DefineTessellationInterfaces(state);
+	DefineDescriptors(state);
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
@@ -674,6 +786,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(
 		    {state.main_func, 5270u, state.input_info.vertex->mesh.max_primitives});
 	}
+	if (state.program.stage == ShaderType::TessellationControl ||
+	    state.program.stage == ShaderType::TessellationEvaluation) {
+		DefineTessellationExecutionModes(state);
+	}
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(CapabilityShader);
@@ -683,9 +799,14 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics) {
-		state.builder.RequireCapability(CapabilityInt64);
-		state.builder.RequireCapability(CapabilityInt64Atomics);
+	if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+	}
+	if (state.requirements.shared_int64_atomics) {
+		state.builder.RequireVersion(0x00010400u);
+		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
+		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(CapabilityClipDistance);
@@ -743,8 +864,22 @@ void DefineModule(EmitterState& state) {
 	     MemoryModelGLSL450});
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
-	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
-	if (const auto* cs = ShaderWorkgroupInput(state.stage, state.input_info)) {
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+	                               32u);
+	if (state.requirements.float64) {
+		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
+		                     state.input_info.compute->float_mode != 0xc0);
+		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
+		state.builder.RequireCapability(spv::CapabilityFloat64);
+		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               64u);
+		// FP64 denormal preservation is temporarily disabled.
+		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
+		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
+	}
+	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_z = 1u;

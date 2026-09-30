@@ -81,7 +81,8 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 		    program.memory_info[li] != program.memory_info[ri]) {
 			return false;
 		}
-	} else if (lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
+	} else if (lhs->GetOpcode() != ValueOpcode::ReadConst &&
+	           lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
 		return false;
 	}
 	for (size_t index = 0; index < lhs->NumArgs(); index++) {
@@ -112,6 +113,10 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
+	// Planning expressions can refer to block values but outlive block storage in the base class.
+	for (auto& inst: value_storage) {
+		inst.Invalidate();
+	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
 	for (auto* block: blocks) {
@@ -183,6 +188,22 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 		}
 	}
 	return invariant;
+}
+
+bool HasShaderMemoryWrites(const Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
@@ -428,13 +449,18 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind != ResourceKind::Buffer &&
-				    memory.kind != ResourceKind::ScalarBuffer) {
+				const bool  vector_buffer = memory.kind == ResourceKind::Buffer ||
+				                            memory.kind == ResourceKind::IndirectBuffer;
+				if (!vector_buffer && memory.kind != ResourceKind::ScalarBuffer) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
+				if (memory.kind == ResourceKind::IndirectBuffer &&
+				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
+				}
 				if (buffer_components > 1u &&
-				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
+				    (!vector_buffer || memory.data_bits != 32u ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));

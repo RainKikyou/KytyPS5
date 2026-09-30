@@ -64,12 +64,8 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
+	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
-	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
-	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -82,18 +78,10 @@ private:
 	struct DownloadPlan;
 
 	struct MetaDataInfo {
-		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
-		// PendingDcc retains that exact fill until an image binding classifies the address,
-		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
-		// Keep all surface metadata in one entry so CMask/FMask can be
-		// registered beside HTile and DCC without introducing parallel tracking paths.
-		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
+		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type       = Type::PendingDcc;
-		uint32_t clear_mask = 0;
-		uint32_t fill_value = 0xffffffffu;
-		uint64_t fill_size  = 0;
-		bool     fill_known = false;
+		Type     type;
+		uint32_t clear_mask = UINT32_MAX;
 	};
 
 	struct OverlapResult {
@@ -103,7 +91,24 @@ private:
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
-	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
+	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+
+	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
+	template <typename Func>
+	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
+		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
+		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
+		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
+		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
+			if constexpr (RETURNS_BOOL) {
+				if (func(page)) {
+					break;
+				}
+			} else {
+				func(page);
+			}
+		}
+	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
@@ -123,7 +128,6 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
-	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -134,7 +138,8 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
+	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -146,13 +151,13 @@ private:
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
-	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
-	                const vk::ClearValue& clear);
+	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
+	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
-	void               AssociateStencil(ImageId depth, GuestRange stencil);
+	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 

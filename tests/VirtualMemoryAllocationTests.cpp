@@ -10,15 +10,34 @@
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "loader/x64InstructionEmulator.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <csignal>
+#include <immintrin.h>
+#include <xbyak/xbyak.h>
+#endif
+
+#if defined(__linux__)
+#include <sys/uio.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -29,6 +48,19 @@
 #undef DeleteFile
 #endif
 #endif
+
+namespace Libs::Fiber {
+struct FiberObject;
+struct FiberOptParam;
+using FiberEntry = KYTY_SYSV_ABI void (*)(uint64_t, uint64_t);
+int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject*, const char*, FiberEntry, uint64_t, void*,
+                                     uint64_t, const FiberOptParam*, uint32_t);
+int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject*);
+int32_t KYTY_SYSV_ABI FiberRun(FiberObject*, uint64_t, uint64_t*);
+int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
+int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
+int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
+} // namespace Libs::Fiber
 
 namespace {
 
@@ -204,10 +236,8 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
 	                                   TRAMPOLINE_SIZE);
 	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
-	const auto result = Loader::PatchRedZoneMemoryInstructions(
-	    mapping, code.size(), function_starts);
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
-	      "failed to flush patched test code");
+	const auto result = Loader::PatchGuestInstructions(
+	    mapping, code.size(), function_starts, true, false);
 	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
 
 	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
@@ -354,11 +384,11 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestPrtBackingReadPreservesSparseResidency() {
-	const char*        test         = "PrtBackingReadPreservesSparseResidency";
-	constexpr uint64_t commit_size  = SceKernelMemoryPoolCommitLen;
-	constexpr uint64_t aperture_len = commit_size * 3;
-	int64_t            pool_offset  = -1;
+void TestSparseBackingReadPreservesResidency() {
+	const char*        test        = "SparseBackingReadPreservesResidency";
+	constexpr uint64_t commit_size = SceKernelMemoryPoolCommitLen;
+	constexpr uint64_t sparse_size = commit_size * 3;
+	int64_t            pool_offset = -1;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMemoryPoolExpand(
 	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), commit_size * 2,
@@ -384,15 +414,13 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	std::memset(reinterpret_cast<void*>(base), 0x3c, commit_size);
 	std::memset(reinterpret_cast<void*>(base + commit_size * 2), 0xa7, commit_size);
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, aperture_len),
-	        "KernelSetPrtAperture");
-	std::vector<uint8_t> bytes(aperture_len, 0x5a);
+	std::vector<uint8_t> bytes(sparse_size, 0x5a);
 	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
 	      "dense backing read accepted a nonresident span");
 	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == 0x5a; }),
 	      "failed dense backing read modified its destination");
-	Check(test, Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), bytes.size()),
-	      "PRT backing read rejected a valid sparse aperture range");
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), bytes.size()),
+	      "sparse backing read rejected a partly committed memory pool");
 	Check(test,
 	      std::all_of(bytes.begin(), bytes.begin() + commit_size,
 	                  [](uint8_t value) { return value == 0x3c; }) &&
@@ -400,22 +428,35 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	                      [](uint8_t value) { return value == 0; }) &&
 	          std::all_of(bytes.begin() + commit_size * 2, bytes.end(),
 	                      [](uint8_t value) { return value == 0xa7; }),
-	      "PRT backing read did not copy resident pages and zero nonresident pages");
+	      "sparse backing read did not copy resident pages and zero nonresident pages");
+	std::fill(bytes.begin(), bytes.end(), 0x5a);
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base + commit_size, bytes.data(),
+	                                                        bytes.size()),
+	      "sparse backing read rejected leading and trailing reservations");
 	Check(test,
-	      !Libs::LibKernel::Memory::TryReadPrtBacking(base + commit_size * 2, bytes.data(),
-	                                                  commit_size * 2),
-	      "PRT backing read crossed the registered aperture");
+	      std::all_of(bytes.begin(), bytes.begin() + commit_size,
+	                  [](uint8_t value) { return value == 0; }) &&
+	          std::all_of(bytes.begin() + commit_size, bytes.begin() + commit_size * 2,
+	                      [](uint8_t value) { return value == 0xa7; }) &&
+	          std::all_of(bytes.begin() + commit_size * 2, bytes.end(),
+	                      [](uint8_t value) { return value == 0; }),
+	      "sparse backing read did not preserve resident data between reserved gaps");
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadSparseBacking(
+	          base + SceKernelMemoryPoolReserveLen - commit_size, bytes.data(), commit_size * 2) &&
+	          std::all_of(bytes.begin(), bytes.begin() + commit_size * 2,
+	                      [](uint8_t value) { return value == 0; }),
+	      "sparse backing read rejected unbacked guest address space beyond a reservation");
 
-	constexpr uint64_t unowned_prt = 0x5000000000ull;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelSetPrtAperture(
-	            2, reinterpret_cast<void*>(unowned_prt), commit_size),
-	        "KernelSetPrtAperture(unowned)");
+	constexpr uint64_t unowned = 0x10000;
+	Check(test, !Libs::LibKernel::Memory::TryReadSparseBacking(unowned, bytes.data(), commit_size),
+	      "sparse backing read accepted an unowned virtual range");
 	Check(test,
-	      !Libs::LibKernel::Memory::TryReadPrtBacking(unowned_prt, bytes.data(), commit_size),
-	      "PRT backing read accepted an unowned virtual range");
-	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
-	        "KernelSetPrtAperture(clear)");
+	      !Libs::LibKernel::Memory::TryReadSparseBacking(
+	          Libs::LibKernel::Memory::kExtendedMemoryBase +
+	              Libs::LibKernel::Memory::kExtendedMemorySize - commit_size,
+	          bytes.data(), commit_size * 2),
+	      "sparse backing read crossed the owned guest address space");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, commit_size, 0),
 	        "KernelMemoryPoolDecommit(first)");
@@ -429,6 +470,84 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(pool_offset, commit_size * 2),
 	        "KernelReleaseDirectMemory(pool expansion)");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestSparseReadDuringDirectCommit() {
+	const char*        test       = "SparseReadDuringDirectCommit";
+	constexpr uint64_t chunk_size = SceKernelMemoryPoolCommitLen;
+	constexpr uint64_t chunks     = 32;
+	constexpr uint64_t size       = chunk_size * chunks;
+	int64_t            physical   = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, chunk_size,
+	            SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	constexpr uint64_t base = 0x80180000000ull;
+	const auto map_chunk = [&](uint64_t index) {
+		void* address = reinterpret_cast<void*>(base + index * chunk_size);
+		return Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+		    &address, chunk_size, SceKernelProtCpuRw, SceKernelMapFixed,
+		    physical + static_cast<int64_t>(index * chunk_size), chunk_size, "sparse_direct");
+	};
+	CheckOk(test, map_chunk(0), "KernelMapNamedDirectMemory(first)");
+	CheckOk(test, map_chunk(chunks - 1), "KernelMapNamedDirectMemory(last)");
+	std::memset(reinterpret_cast<void*>(base), 0x3c, chunk_size);
+	std::memset(reinterpret_cast<void*>(base + (chunks - 1) * chunk_size), 0xa7, chunk_size);
+
+	std::vector<uint8_t> bytes(size, 0x5a);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), size),
+	      "dense backing read accepted unbacked guest address space");
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size),
+	      "sparse read rejected a partly committed direct mapping");
+	Check(test, bytes.front() == 0x3c && bytes[chunk_size] == 0 && bytes.back() == 0xa7,
+	      "sparse read lost resident bytes or sparse zeros");
+	Libs::LibKernel::Memory::TestFailNextVirtualRangeReplacement();
+	CheckFailed(test, map_chunk(1), "KernelMapNamedDirectMemory(injected replacement failure)");
+	ExpectRange(test, Query(test, base + chunk_size), base + chunk_size,
+	            base + chunk_size * 2, 0, 0, 0, 0, 0, "anon");
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base + chunk_size, bytes.data(),
+	                                                    chunk_size) &&
+	                Libs::LibKernel::Memory::TryReadSparseBacking(base, bytes.data(), size) &&
+	                bytes[chunk_size] == 0,
+	      "failed direct publication did not restore sparse reservation and backing");
+
+	std::atomic<bool>     started {false};
+	std::atomic<bool>     stop {false};
+	std::atomic<bool>     read_failed {false};
+	std::atomic<uint32_t> reads {0};
+	std::thread reader([&] {
+		std::vector<uint8_t> snapshot(size);
+		started.store(true, std::memory_order_release);
+		while (!stop.load(std::memory_order_acquire)) {
+			if (!Libs::LibKernel::Memory::TryReadSparseBacking(base, snapshot.data(), size) ||
+			    snapshot.front() != 0x3c || snapshot.back() != 0xa7) {
+				read_failed.store(true, std::memory_order_relaxed);
+			}
+			reads.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+	while (!started.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+	int map_result = OK;
+	for (uint64_t index = 1; index + 1 < chunks; ++index) {
+		map_result = map_chunk(index);
+		if (map_result != OK) {
+			break;
+		}
+	}
+	stop.store(true, std::memory_order_release);
+	reader.join();
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size),
+	        "KernelReleaseDirectMemory");
+	CheckOk(test, map_result, "KernelMapNamedDirectMemory(middle)");
+	Check(test, reads.load(std::memory_order_relaxed) != 0 &&
+	                !read_failed.load(std::memory_order_relaxed),
+	      "sparse read observed a gap while direct backing was committed");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -839,6 +958,10 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 2),
 	      "runtime allocation is outside the owner");
 	*reinterpret_cast<uint64_t*>(base) = 0x52554e54494d454full; // "RUNTIMEO"
+	uint64_t snapshot = UINT64_MAX;
+	Check(test, !Libs::LibKernel::Memory::TryReadSparseBacking(base, &snapshot, sizeof(snapshot)) &&
+	                snapshot == UINT64_MAX,
+	      "sparse backing read replaced private committed data with zeros");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestMemory(base, SceKernelPageSize,
 	                                                  Common::VirtualMemory::Mode::Read),
@@ -847,6 +970,9 @@ void TestRuntimeMemoryOwnerLifecycle() {
 	      "runtime free failed");
 	Check(test, Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, SceKernelPageSize * 2),
 	      "runtime free did not restore the owner placeholder");
+	Check(test, Libs::LibKernel::Memory::TryReadSparseBacking(base, &snapshot, sizeof(snapshot)) &&
+	                snapshot == 0,
+	      "sparse backing read rejected freed guest-owned memory");
 
 	const auto reused = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    base, SceKernelPageSize * 2, Common::VirtualMemory::Mode::ReadWrite, "runtime_reuse", true);
@@ -1187,6 +1313,43 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if defined(__linux__)
+void TestPartialUnmapPreservesHostPermissions() {
+	const char* test = "PartialUnmapPreservesHostPermissions";
+	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
+	                                   "unmap_host_permissions");
+	using Common::VirtualMemory::Mode;
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
+	      "could not protect the left survivor from writes");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base + SceKernelPageSize * 2,
+	                                                      SceKernelPageSize, Mode::NoAccess),
+	      "could not protect the right survivor from reads");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	// Probe actual host access without taking a signal or changing the page protections.
+	uint64_t value = 0;
+	iovec local {&value, sizeof(value)};
+	iovec left {reinterpret_cast<void*>(base), sizeof(value)};
+	iovec right {reinterpret_cast<void*>(base + SceKernelPageSize * 2), sizeof(value)};
+	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value),
+	      "partial unmap removed read access to the left survivor");
+	Check(test, process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1,
+	      "partial unmap removed the left survivor's write protection");
+	Check(test, process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
+	      "partial unmap removed the right survivor's read protection");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(left cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
+	        "KernelMunmap(right cleanup)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
 
 void TestDirectMapValidationBeforeOwnerMutation() {
 	const char* test    = "DirectMapValidationBeforeOwnerMutation";
@@ -2055,6 +2218,51 @@ void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestExtendedAndUserMappingsDoNotAlias() {
+	const char* test = "ExtendedAndUserMappingsDoNotAlias";
+	// macOS starts its ordinary guest range at 448 GiB.
+	constexpr uint64_t user_address = 0x7000000000ull;
+	const uint64_t addresses[] {
+	    user_address,
+	    Libs::LibKernel::Memory::kExtendedMemoryBase + user_address,
+	    Libs::LibKernel::Memory::kExtendedMemoryBase + Libs::LibKernel::Memory::kExtendedMemorySize -
+	        SceKernelPageSize,
+	};
+	int64_t physical = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize * std::size(addresses), SceKernelPageSize, SceKernelMtypeC,
+	            &physical),
+	        "KernelAllocateDirectMemory");
+	for (size_t i = 0; i < std::size(addresses); ++i) {
+		void* mapped = reinterpret_cast<void*>(addresses[i]);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapDirectMemory(
+		            &mapped, SceKernelPageSize, SceKernelProtCpuRw,
+		            SceKernelMapFixed | SceKernelMapNoOverwrite,
+		            physical + i * SceKernelPageSize, SceKernelPageSize),
+		        "KernelMapDirectMemory");
+		Check(test, mapped == reinterpret_cast<void*>(addresses[i]), "fixed mapping moved");
+		*static_cast<uint64_t*>(mapped) = 0x0123456700000000ull + i;
+	}
+	for (size_t i = 0; i < std::size(addresses); ++i) {
+		uint64_t value = 0;
+		Check(test,
+		      Libs::LibKernel::Memory::TryReadBacking(addresses[i], &value, sizeof(value)) &&
+		          value == 0x0123456700000000ull + i &&
+		          *reinterpret_cast<uint64_t*>(addresses[i]) == value,
+		      "Extended and user mappings overlap or lost their backing");
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(addresses[i], SceKernelPageSize),
+		        "KernelMunmap");
+	}
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+	            physical, SceKernelPageSize * std::size(addresses)),
+	        "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestLargeHintedReserveHostsSmallDirectMap() {
 	const char* test = "LargeHintedReserveHostsSmallDirectMap";
 
@@ -2109,6 +2317,128 @@ void TestLargeHintedReserveHostsSmallDirectMap() {
 	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(arena), arena_size),
 	        "KernelMunmap(arena reserve)");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAutomaticMemoryReuseAndAliases() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AutomaticMemoryReuseAndAliases";
+	constexpr uint64_t block    = 0x200000;
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t base     = kExtendedMemoryBase + 0x20000000;
+	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
+	int64_t            physical = -1;
+	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
+	        "allocate automatic backing");
+	CheckOk(test, MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory");
+	*reinterpret_cast<uint64_t*>(base + page * 3) = 0x0123456789abcdefull;
+	auto* first_alias                             = reinterpret_cast<void*>(base + block * 2);
+	auto* second_alias                            = reinterpret_cast<void*>(base + block * 3);
+	CheckOk(test,
+	        KernelMapDirectMemory(&first_alias, page * 3, SceKernelProtCpuRw, SceKernelMapFixed,
+	                              physical + page, page),
+	        "KernelMapDirectMemory(first alias)");
+	CheckOk(test,
+	        KernelMapDirectMemory(&second_alias, page * 2, SceKernelProtCpuRw, SceKernelMapFixed,
+	                              physical + page * 2, page),
+	        "KernelMapDirectMemory(overlapping alias)");
+	TestFailPhysicalMemoryUnmapAfter(1);
+	CheckFailed(test, KernelCheckedReleaseDirectMemory(physical, block),
+	            "KernelCheckedReleaseDirectMemory(rollback)");
+	Check(test,
+	      MapAutomaticMemory(base + block * 4, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
+	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
+	      "restored mappings remained available to the automatic allocator");
+	CheckOk(test, KernelMunmap(base, block), "KernelMunmap(original)");
+	Check(test,
+	      MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw) ==
+	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
+	      "automatic allocation reused aliased pages or ordinary physical memory");
+	CheckOk(test, MapAutomaticMemory(base, block - page * 3, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory(fragmented reuse)");
+	Check(test,
+	      Query(test, base).offset == static_cast<uint64_t>(physical) &&
+	          Query(test, base + page).offset == static_cast<uint64_t>(physical + page * 4),
+	      "automatic allocation did not skip the union of overlapping aliases");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(first_alias), page * 3),
+	        "KernelMunmap(first alias)");
+	CheckOk(test, MapAutomaticMemory(base + block * 4, page, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory(partial alias release)");
+	Check(test, Query(test, base + block * 4).offset == static_cast<uint64_t>(physical + page),
+	      "partial alias release did not reclaim its unreferenced page");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(second_alias), page),
+	        "KernelMunmap(partial second alias)");
+	CheckOk(test, MapAutomaticMemory(base + block * 5, page, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory(partial unmap)");
+	Check(test, Query(test, base + block * 5).offset == static_cast<uint64_t>(physical + page * 2),
+	      "partial unmap did not reclaim the matching physical page");
+	Check(test, *reinterpret_cast<uint64_t*>(base + block * 3 + page) == 0x0123456789abcdefull,
+	      "automatic reuse changed a surviving alias");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
+	        "KernelCheckedReleaseDirectMemory(donation)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + block * 3 + page);
+	Check(test,
+	      MapAutomaticMemory(base, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
+	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
+	      "released donation remained in the automatic free list");
+	int64_t reused = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(physical, physical + block, block, block, SceKernelMtypeC,
+	                                   &reused),
+	        "KernelAllocateDirectMemory(released donation)");
+	Check(test, reused == physical, "donation did not return to the ordinary allocator");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(reused, block), "release ordinary reuse");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAutomaticMemoryFragmentedMapRollback() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test   = "AutomaticMemoryFragmentedMapRollback";
+	constexpr uint64_t block  = 0x200000;
+	constexpr uint64_t base   = kExtendedMemoryBase + 0x22000000;
+	const auto         end    = static_cast<int64_t>(KernelGetDirectMemorySize());
+	int64_t            first  = -1;
+	int64_t            gap    = -1;
+	int64_t            second = -1;
+	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &first, true), "first donation");
+	CheckOk(test, AllocateDirectMemory(first + block, end, block, block, 0, &gap),
+	        "ordinary allocation between donations");
+	CheckOk(test, AllocateDirectMemory(gap + block, end, block, block, 0, &second, true),
+	        "second donation");
+	Check(test, gap == first + block && second == gap + block,
+	      "test setup did not produce adjacent ownership ranges");
+	auto* address = reinterpret_cast<void*>(base);
+	CheckOk(test, KernelReserveVirtualRange(&address, block, SceKernelMapFixed, block),
+	        "reserve first mapping piece");
+	TestFailNextFixedReserveRangeRegistration();
+	CheckFailed(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
+	            "MapAutomaticMemory(second-piece failure)");
+	ExpectUnmapped(test, base);
+	CheckOk(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory(after rollback)");
+	Check(test,
+	      Query(test, base).offset == static_cast<uint64_t>(first) &&
+	          Query(test, base + block).offset == static_cast<uint64_t>(second),
+	      "fragmented map did not preserve both donated physical ranges");
+	auto* alias = reinterpret_cast<void*>(base + block * 3);
+	CheckOk(
+	    test,
+	    KernelMapDirectMemory(&alias, block * 2, SceKernelProtCpuRw, SceKernelMapFixed, gap, block),
+	    "alias across ordinary and donated ownership");
+	CheckOk(test, KernelMunmap(base, block * 2), "unmap fragmented allocation");
+	CheckFailed(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
+	            "automatic allocation while second donation remains aliased");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(alias), block * 2),
+	        "unmap mixed ownership alias");
+	CheckFailed(test, MapAutomaticMemory(base, block * 3, SceKernelMtypeC, SceKernelProtCpuRw),
+	            "automatic allocation beyond donated capacity");
+	CheckOk(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "reuse both donations after final alias removal");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(first, block), "release first donation");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(gap, block), "release ordinary allocation");
+	CheckOk(test, KernelCheckedReleaseDirectMemory(second, block), "release second donation");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -2538,23 +2868,475 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+volatile sig_atomic_t g_rsqrt_traps = 0;
+
+bool EmulateReciprocalSquareRootContext(void* context) {
+	const auto host_mxcsr = _mm_getcsr();
+	_mm_setcsr(0x7fe1); // Exercise the handler under a distinct rounding mode and raised flags.
+	const bool emulated        = Loader::X64InstructionEmulator::TryEmulate(context);
+	const bool preserved_mxcsr = _mm_getcsr() == 0x7fe1;
+	_mm_setcsr(host_mxcsr);
+	if (!emulated || !preserved_mxcsr) {
+		return false;
+	}
+	g_rsqrt_traps = g_rsqrt_traps + 1;
+	return true;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+LONG CALLBACK ReciprocalSquareRootHandler(EXCEPTION_POINTERS* exception) {
+	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION ||
+	    !EmulateReciprocalSquareRootContext(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+#else
+void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
+	if (!EmulateReciprocalSquareRootContext(context)) {
+		_exit(190);
+	}
+}
+#endif
+
+void TestPackedReciprocalSquareRoot() {
+	const char* test = "PackedReciprocalSquareRoot";
+	constexpr uint64_t code_size = 0x4000;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t allocation_size = code_size * 2;
+#else
+	constexpr uint64_t allocation_size = code_size;
+#endif
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
+	Check(test, mapping != 0, "failed to allocate instruction test code");
+	struct RestoreState {
+		uint64_t mapping;
+		uint64_t size;
+		uint32_t mxcsr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		void* handler = nullptr;
+#else
+		struct sigaction previous {};
+		bool installed = false;
+#endif
+		~RestoreState() {
+			_mm_setcsr(mxcsr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (handler != nullptr) {
+				RemoveVectoredExceptionHandler(handler);
+			}
+			Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
+#else
+			if (installed) {
+				sigaction(SIGILL, &previous, nullptr);
+			}
+#endif
+			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
+		}
+	} restore {mapping, allocation_size, _mm_getcsr()};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	restore.handler = AddVectoredExceptionHandler(1, ReciprocalSquareRootHandler);
+	Check(test, restore.handler != nullptr, "failed to install instruction handler");
+#else
+	struct sigaction action {};
+	action.sa_sigaction = ReciprocalSquareRootHandler;
+	action.sa_flags = SA_SIGINFO;
+	sigemptyset(&action.sa_mask);
+	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
+	Check(test, restore.installed, "failed to install instruction handler");
+#endif
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const auto refine = [](float estimate) {
+		return (estimate * 0.5f) * std::fma(-estimate, estimate, 3.0f);
+	};
+	constexpr uint64_t red_zone_sentinel = 0x1122334455667788ull;
+	std::array<uint32_t, 16> input {};
+	std::array<uint32_t, 48> output {};
+	input.fill(0x3f800000);
+	for (const auto registers: {std::array {2, 1}, std::array {10, 9}, std::array {1, 1}}) {
+		const auto destination = registers[0];
+		const auto source = registers[1];
+		input[0] = 0x3f800000;
+		uint32_t expected = 0x3f800000;
+		if (source == 9) {
+			input[0] = 0x40800000;
+			expected = 0x3f000000;
+		}
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		if (source == 9) {
+			code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi + 32]);
+		}
+		code.vmovups(Xbyak::Ymm(source), code.ptr[code.rdi]);
+		if (destination != source) {
+			code.vmovups(Xbyak::Ymm(destination), code.ptr[code.rdi + 32]);
+		}
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, red_zone_sentinel ^ offset);
+			code.mov(code.qword[code.rsp - offset], code.rax);
+		}
+		code.vrsqrtps(Xbyak::Xmm(destination), Xbyak::Xmm(source));
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, code.qword[code.rsp - offset]);
+			code.mov(code.qword[code.rsi + 64 + offset - 8], code.rax);
+		}
+		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(destination));
+		code.vmovups(code.ptr[code.rsi + 32], Xbyak::Ymm(source));
+		code.vzeroupper();
+		code.ret();
+#if defined(__linux__)
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+#endif
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated instruction test code");
+		function(input.data(), output.data());
+		const float native = std::bit_cast<float>(output[0]);
+		const auto red_zone_intact = [&] {
+			for (uint32_t offset = 8; offset <= 128; offset += 8) {
+				const auto index = 16 + (offset - 8) / sizeof(uint32_t);
+				const auto value = static_cast<uint64_t>(output[index]) |
+				                   (static_cast<uint64_t>(output[index + 1]) << 32);
+				if (value != (red_zone_sentinel ^ offset)) {
+					return false;
+				}
+			}
+			return true;
+		};
+		Check(test, red_zone_intact(), "native instruction corrupted the guest red zone");
+		Check(test, std::isfinite(native) && std::abs(native - std::bit_cast<float>(expected)) < 0.001f,
+		      "native reciprocal root is outside its error bound");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                   reinterpret_cast<void*>(mapping + code_size), code_size);
+		const std::array<uintptr_t, 1> function_starts {mapping};
+		// The extended-register case also relocates ordinary memory accesses while
+		// red-zone data is live, exercising both enabled patchers in one function.
+		const bool protect_memory = source == 9;
+		const auto patched = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, protect_memory, true);
+		Check(test, patched.reciprocal_sqrt_instruction_count == 1 &&
+		                patched.unrelocatable_memory_instruction_count == 0 &&
+		                (protect_memory ? patched.patched_memory_instruction_count > 0
+		                                : patched.patched_memory_instruction_count == 0),
+		      "instruction pass lost reciprocal root or memory patch coverage");
+#else
+		Check(test, Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(mapping, code.getSize()) == 1,
+		      "instruction pass did not patch exactly one packed reciprocal root");
+		const auto* patched = reinterpret_cast<const uint8_t*>(mapping);
+		size_t changed = 0;
+		for (size_t i = 0; i < original.size(); ++i) {
+			changed += original[i] != patched[i];
+		}
+		Check(test, changed == 1, "instruction pass changed unrelated code bytes");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush patched instruction test code");
+#endif
+		const auto before = g_rsqrt_traps;
+		function(input.data(), output.data());
+		Check(test, g_rsqrt_traps == before + 1, "patched instruction did not execute its handler");
+		Check(test, red_zone_intact(), "patched instruction corrupted the guest red zone");
+		Check(test, output[0] == expected, "patched instruction read or wrote the wrong register");
+		if (destination != source) {
+			Check(test, std::equal(input.begin(), input.begin() + 4, output.begin() + 8),
+			      "source lower XMM lanes were corrupted");
+		}
+		if (source != 9) {
+			Check(test, refine(refine(std::bit_cast<float>(output[0]))) == 1.0f,
+			      "identity quaternion normalization drifted below one");
+		}
+		for (size_t i = 0; i < 4; ++i) {
+			Check(test, output[4 + i] == 0, "128-bit VEX destination retained upper YMM lanes");
+			const auto expected_upper = destination == source ? 0u : input[4 + i];
+			Check(test, output[12 + i] == expected_upper, "source upper YMM lanes were corrupted");
+		}
+		std::printf("[host]    rsqrt xmm%d,xmm%d native=%08x patched=%08x\n",
+		            destination, source, std::bit_cast<uint32_t>(native), output[0]);
+		if (destination != 2) {
+			continue;
+		}
+		constexpr std::array<std::array<uint32_t, 8>, 4> cases {{
+		    {0x00000000, 0x80000000, 0x00000001, 0x80000001,
+		     0x7f800000, 0xff800000, 0x7f800000, 0xff800000},
+		    {0x7f800000, 0xff800000, 0xbf800000, 0x7fc12345,
+		     0x00000000, 0xffc00000, 0xffc00000, 0x7fc12345},
+		    {0x7f812345, 0xff812345, 0x40800000, 0x40000000,
+		     0x7fc12345, 0xffc12345, 0x3f000000, 0x3f3504f3},
+		    {0x00800000, 0x7f7fffff, 0x3f800000, 0x41800000,
+		     0x5f000000, 0x1f800000, 0x3f800000, 0x3e800000},
+		}};
+		for (const auto& values: cases) {
+			std::copy_n(values.begin(), 4, input.begin());
+			for (uint32_t controls = 0; controls < 8; ++controls) {
+				const uint32_t mxcsr = 0x1fa1u | ((controls & 3u) << 13u) | ((controls & 4u) << 4u);
+				_mm_setcsr(mxcsr);
+				function(input.data(), output.data());
+				const auto result_mxcsr = _mm_getcsr();
+				_mm_setcsr(restore.mxcsr);
+				Check(test, red_zone_intact(), "special-value trap corrupted the guest red zone");
+				Check(test, result_mxcsr == mxcsr, "instruction changed MXCSR controls or exception flags");
+				Check(test, std::equal(output.begin(), output.begin() + 4, values.begin() + 4),
+				      "special values or round-independent reciprocal roots differ from ISA semantics");
+			}
+		}
+		input.fill(0x3f800000);
+	}
+#if defined(__linux__)
+	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
+	ucontext_t context {};
+	context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(unknown.data());
+	Check(test, !Loader::X64InstructionEmulator::TryEmulate(&context), "unrecognized UD2 was swallowed");
+	_libc_fpstate fpstate {};
+	context.uc_mcontext.fpregs = &fpstate;
+	const auto emulate = [&](std::array<uint8_t, 16> instruction, size_t length) {
+		context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(instruction.data());
+		Check(test, Loader::X64InstructionEmulator::TryEmulate(&context), "existing instruction emulation was rejected");
+		Check(test, context.uc_mcontext.gregs[REG_RIP] == reinterpret_cast<greg_t>(instruction.data() + length),
+		      "existing instruction emulation advanced RIP incorrectly");
+	};
+	fpstate._xmm[8].element[0] = 0x1234;
+	fpstate._xmm[8].element[2] = 0xdeadbeef;
+	emulate({0x66, 0x41, 0x0f, 0x78, 0xc0, 8, 4}, 7); // extrq xmm8, 8, 4
+	Check(test, fpstate._xmm[8].element[0] == 0x23 && fpstate._xmm[8].element[2] == 0,
+	      "SSE4a extraction lost its extended register or upper-half semantics");
+	fpstate._xmm[1].element[0] = 0x1234;
+	fpstate._xmm[8].element[0] = 0xffffc4c8;
+	emulate({0x66, 0x41, 0x0f, 0x79, 0xc8}, 5); // observed fault: extrq xmm1, xmm8
+	Check(test, fpstate._xmm[1].element[0] == 0x23 && fpstate._xmm[8].element[0] == 0xffffc4c8,
+	      "register EXTRQ lost its source controls, ignored bits, or separate destination");
+	fpstate._xmm[11].element[0] = 0x89abcdef;
+	fpstate._xmm[11].element[1] = 0x01234567;
+	fpstate._xmm[0].element[0] = 0x2010;
+	emulate({0x66, 0x44, 0x0f, 0x79, 0xd8}, 5); // extrq xmm11, xmm0
+	Check(test, fpstate._xmm[11].element[0] == 0x4567 && fpstate._xmm[11].element[1] == 0,
+	      "register EXTRQ lost its extended destination or 64-bit extraction");
+	fpstate._xmm[8].element[0] = 0x89abcdef;
+	fpstate._xmm[8].element[1] = 0x01234567;
+	fpstate._xmm[9].element[0] = 0;
+	emulate({0x66, 0x45, 0x0f, 0x79, 0xc1}, 5); // extrq xmm8, xmm9
+	Check(test, fpstate._xmm[8].element[0] == 0x89abcdef && fpstate._xmm[8].element[1] == 0x01234567,
+	      "register EXTRQ did not interpret zero length as 64 bits");
+	fpstate._xmm[3].element[0] = 0xab0408;
+	emulate({0x66, 0x0f, 0x79, 0xdb}, 4); // extrq xmm3, xmm3
+	Check(test, fpstate._xmm[3].element[0] == 0x40,
+	      "register EXTRQ overwrote aliased controls before reading them");
+	fpstate._xmm[8].element[0] = 0x1111;
+	fpstate._xmm[8].element[2] = 0xdeadbeef;
+	fpstate._xmm[9].element[0] = 0xab;
+	emulate({0xf2, 0x45, 0x0f, 0x78, 0xc1, 8, 4}, 7); // insertq xmm8, xmm9, 8, 4
+	Check(test, fpstate._xmm[8].element[0] == 0x1ab1 && fpstate._xmm[8].element[2] == 0xdeadbeef,
+	      "SSE4a insertion corrupted its destination lanes");
+	std::array<uint32_t, 8> sha_source {0, 0, 0, 0, 5, 6, 7, 8};
+	context.uc_mcontext.gregs[REG_RDI] = reinterpret_cast<greg_t>(sha_source.data());
+	for (uint32_t lane = 0; lane < 4; ++lane) {
+		fpstate._xmm[8].element[lane] = lane + 1;
+	}
+	emulate({0x44, 0x0f, 0x38, 0xc9, 0x47, 0x10}, 6); // sha1msg1 xmm8, [rdi+16]
+	constexpr std::array<uint32_t, 4> sha_expected {6, 10, 2, 6};
+	Check(test, std::equal(sha_expected.begin(), sha_expected.end(), fpstate._xmm[8].element),
+	      "SHA emulation lost its memory operand or extended destination register");
+	emulate({0x0f, 0x01, 0xfa}, 3); // monitorx
+#endif
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr int32_t FiberErrorState = -2141650938; // SCE_FIBER_ERROR_STATE
+constexpr int32_t FiberErrorPermission = -2141650939;
+
+struct FiberRoundTrip {
+	Libs::Fiber::FiberObject* first;
+	Libs::Fiber::FiberObject* second;
+	std::atomic<bool> running {false};
+	std::atomic<bool> release {false};
+	int first_errors = 0;
+	int second_errors = 0;
+	uint32_t first_visits = 0;
+	uint32_t second_visits = 0;
+	uint64_t first_arg = 0;
+	uint64_t second_arg = 0;
+};
+
+[[noreturn]] void KYTY_SYSV_ABI FirstFiberEntry(uint64_t initial, uint64_t arg) {
+	auto& data = *reinterpret_cast<FiberRoundTrip*>(initial);
+	for (;;) {
+		Libs::Fiber::FiberObject* self = nullptr;
+		data.first_errors |= Libs::Fiber::FiberGetSelf(&self);
+		data.first_errors |= self != data.first;
+		data.first_errors |= Libs::Fiber::FiberSwitch(self, 0, nullptr) != FiberErrorState;
+		if (data.first_errors != 0) {
+			__builtin_trap();
+		}
+		++data.first_visits;
+		data.first_arg = arg;
+		if (arg == 20) {
+			data.running.store(true, std::memory_order_release);
+			while (!data.release.load(std::memory_order_acquire)) {
+				asm volatile("pause");
+			}
+		}
+		data.first_errors |= Libs::Fiber::FiberSwitch(data.second, arg + 1, &arg);
+		if (data.first_errors != 0) {
+			__builtin_trap();
+		}
+		data.first_errors |= Libs::Fiber::FiberReturnToThread(arg + 1, &arg);
+	}
+}
+
+[[noreturn]] void KYTY_SYSV_ABI SecondFiberEntry(uint64_t initial, uint64_t arg) {
+	auto& data = *reinterpret_cast<FiberRoundTrip*>(initial);
+	for (;;) {
+		Libs::Fiber::FiberObject* self = nullptr;
+		data.second_errors |= Libs::Fiber::FiberGetSelf(&self);
+		data.second_errors |= self != data.second;
+		if (data.second_errors != 0) {
+			__builtin_trap();
+		}
+		++data.second_visits;
+		data.second_arg = arg;
+		data.second_errors |= Libs::Fiber::FiberSwitch(data.first, arg + 1, &arg);
+		if (data.second_errors != 0) {
+			__builtin_trap();
+		}
+	}
+}
+
+void TestSmallFiberStacksAndMigration() {
+	const char* test = "SmallFiberStacksAndMigration";
+	// 256-byte objects, 8-byte object alignment, 16-byte context
+	// alignment, and a 512-byte minimum context. The game supplies 2048 bytes.
+	for (const size_t stack_size: {512u, 2048u}) {
+		alignas(8) std::array<uint8_t, 256> first_object {};
+		alignas(8) std::array<uint8_t, 256> second_object {};
+		constexpr size_t GuardSize = 4096;
+		alignas(16) std::array<uint8_t, GuardSize + 2048 + 64> first_stack;
+		alignas(16) std::array<uint8_t, GuardSize + 2048 + 64> second_stack;
+		first_stack.fill(0xa5);
+		second_stack.fill(0xa5);
+		FiberRoundTrip data {reinterpret_cast<Libs::Fiber::FiberObject*>(first_object.data()),
+		                     reinterpret_cast<Libs::Fiber::FiberObject*>(second_object.data())};
+		CheckOk(test, Libs::Fiber::FiberInitialize(data.first, "first", FirstFiberEntry,
+		    reinterpret_cast<uint64_t>(&data), first_stack.data() + GuardSize, stack_size,
+		    nullptr, 0x0a000000), "initialize first fiber");
+		CheckOk(test, Libs::Fiber::FiberInitialize(data.second, "second", SecondFiberEntry,
+		    reinterpret_cast<uint64_t>(&data), second_stack.data() + GuardSize, stack_size,
+		    nullptr, 0x0a000000), "initialize second fiber");
+		const auto thread_context_is_clear = [&] {
+			Libs::Fiber::FiberObject* self = data.first;
+			return Libs::Fiber::FiberGetSelf(&self) == OK && self == nullptr &&
+			       Libs::Fiber::FiberSwitch(data.first, 0, nullptr) == FiberErrorPermission &&
+			       Libs::Fiber::FiberReturnToThread(0, nullptr) == FiberErrorPermission;
+		};
+		Check(test, thread_context_is_clear(), "thread retained a fiber context before its first run");
+		uint64_t first_base = 0;
+		uint64_t second_base = 0;
+		std::memcpy(&first_base, first_stack.data() + GuardSize, sizeof(first_base));
+		std::memcpy(&second_base, second_stack.data() + GuardSize, sizeof(second_base));
+		const auto check_stacks = [&] {
+			for (const auto* stack: {&first_stack, &second_stack}) {
+				const auto is_guard = [](uint8_t byte) { return byte == 0xa5; };
+				Check(test, std::all_of(stack->begin(), stack->begin() + GuardSize, is_guard) &&
+				                std::all_of(stack->begin() + GuardSize + stack_size, stack->end(), is_guard),
+				      "fiber wrote outside its supplied stack");
+			}
+			Check(test, std::memcmp(&first_base, first_stack.data() + GuardSize, sizeof(first_base)) == 0 &&
+			                std::memcmp(&second_base, second_stack.data() + GuardSize, sizeof(second_base)) == 0,
+			      "fiber overwrote the bottom of its stack");
+		};
+		uint64_t returned = 0;
+		CheckOk(test, Libs::Fiber::FiberRun(data.first, 10, &returned), "run first fiber");
+		Check(test, returned == 13 && data.first_visits == 1 && data.second_visits == 1 &&
+		                data.first_arg == 10 && data.second_arg == 11,
+		      "switch/return arguments were not preserved");
+		Check(test, thread_context_is_clear(), "run retained its thread context after returning");
+		check_stacks();
+
+		std::atomic<bool> done {false};
+		int worker_result = -1;
+		int worker_repeat_result = -1;
+		bool worker_context_clear = false;
+		uint64_t worker_returned = 0;
+		uint64_t worker_repeat_returned = 0;
+		std::thread worker([&] {
+			worker_context_clear = thread_context_is_clear();
+			worker_result = Libs::Fiber::FiberRun(data.first, 20, &worker_returned);
+			worker_context_clear = thread_context_is_clear() && worker_context_clear;
+			worker_repeat_result = Libs::Fiber::FiberRun(data.first, 30, &worker_repeat_returned);
+			worker_context_clear = thread_context_is_clear() && worker_context_clear;
+			done.store(true, std::memory_order_release);
+		});
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!data.running.load(std::memory_order_acquire) &&
+		       !done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+		const bool running = data.running.load(std::memory_order_acquire);
+		Libs::Fiber::FiberObject* main_self = data.first;
+		const int main_self_result = Libs::Fiber::FiberGetSelf(&main_self);
+		const int busy_run = running ? Libs::Fiber::FiberRun(data.first, 30, nullptr) : 0;
+		const int busy_finalize = running ? Libs::Fiber::FiberFinalize(data.first) : 0;
+		data.release.store(true, std::memory_order_release);
+		worker.join();
+		Check(test, thread_context_is_clear() && main_self_result == OK && main_self == nullptr,
+		      "migrated fiber changed the original thread's current fiber");
+		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState,
+		      "running fiber was not exclusively owned");
+		CheckOk(test, worker_result, "resume fiber on another thread");
+		CheckOk(test, worker_repeat_result, "repeat run on another thread");
+		Check(test, worker_context_clear, "worker retained a context outside a fiber run");
+		Check(test, worker_returned == 23 && worker_repeat_returned == 33 &&
+		                data.first_visits == 3 && data.second_visits == 3 &&
+		                data.first_arg == 30 && data.second_arg == 31 &&
+		                data.first_errors == 0 && data.second_errors == 0,
+		      "migration lost fiber identity, arguments, or resumable contexts");
+		CheckOk(test, Libs::Fiber::FiberRun(data.first, 40, &returned), "migrate fiber back to original thread");
+		Check(test, returned == 43 && data.first_visits == 4 && data.second_visits == 4 &&
+		                data.first_arg == 40 && data.second_arg == 41 &&
+		                data.first_errors == 0 && data.second_errors == 0,
+		      "return migration reused an expired thread context");
+		Check(test, thread_context_is_clear(), "repeated run retained its thread context after returning");
+		check_stacks();
+		CheckOk(test, Libs::Fiber::FiberFinalize(data.first), "finalize first suspended fiber");
+		CheckOk(test, Libs::Fiber::FiberFinalize(data.second), "finalize second suspended fiber");
+		std::printf("[host]    %s stack=%zu ok\n", test, stack_size);
+	}
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
 	InitSubsystems();
-	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-exit-only") == 0) {
-		RunTest(TestGuestStackExitLifecycle);
+#if defined(__x86_64__) || defined(_M_X64)
+	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
+		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
+		RunTest(TestPackedReciprocalSquareRoot);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
+#if defined(__x86_64__) || defined(_M_X64)
+	RunTest(TestSmallFiberStacksAndMigration);
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestPackedReciprocalSquareRoot);
+#endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
-	RunTest(TestPrtBackingReadPreservesSparseResidency);
+	RunTest(TestSparseBackingReadPreservesResidency);
+	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
@@ -2576,6 +3358,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+#if defined(__linux__)
+	RunTest(TestPartialUnmapPreservesHostPermissions);
+#endif
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
@@ -2593,6 +3378,9 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
 	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
+	RunTest(TestExtendedAndUserMappingsDoNotAlias);
+	RunTest(TestAutomaticMemoryReuseAndAliases);
+	RunTest(TestAutomaticMemoryFragmentedMapRollback);
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);

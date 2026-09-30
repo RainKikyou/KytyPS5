@@ -360,6 +360,23 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+struct SpirvRequirements {
+	bool subgroup_ballot              = false;
+	bool subgroup_shuffle             = false;
+	bool subgroup_local_invocation_id = false;
+	bool compute_derivatives          = false;
+	bool image_gather_extended        = false;
+	bool function_lds                 = false;
+	bool function_scratch             = false;
+	bool pixel_valid_mask             = false;
+	bool buffer_int64_atomics         = false;
+	bool shared_int64_atomics         = false;
+	bool coherent_buffers             = false;
+	bool float64                      = false;
+};
+
+SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -368,8 +385,11 @@ struct EmitterState {
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
-	const IR::SpirvRequirements&                     requirements;
-	ShaderType                                       stage                   = ShaderType::Unknown;
+	std::array<uint32_t, 6>                          tess_variables {};
+	uint32_t                                         tess_inner_variable = 0;
+	uint32_t                                         tess_patch_base     = 0;
+
+	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
@@ -387,9 +407,7 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
-	uint32_t                                         compact_lds_dwords      = 0;
-	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
-	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
+	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -407,6 +425,7 @@ struct EmitterState {
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
+	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
@@ -431,6 +450,7 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
@@ -455,7 +475,11 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 
 inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, value});
+	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
+	if constexpr (type == IR::Type::F64 &&
+	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
 	return result;
 }
 
@@ -594,8 +618,6 @@ uint32_t ConstantI32(EmitterState& state, int32_t value);
 
 uint32_t ConstantF32(EmitterState& state, uint32_t bits);
 
-uint32_t FloatBits(float value);
-
 uint32_t ConstantF32Value(EmitterState& state, float value);
 
 uint32_t ConstantBool(EmitterState& state, bool value);
@@ -604,31 +626,19 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
-uint32_t GlslStd450(EmitterState& state);
-
-void AllocateInputVariables(EmitterState& state);
-
-void AllocateOutputVariables(EmitterState& state);
-
-uint32_t BuiltInForInput(IR::StageInputKind kind);
-
-void AddInputAnnotationsAndNames(EmitterState& state);
-
-void AddOutputAnnotationsAndNames(EmitterState& state);
-
-void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name,
-                        IR::DescriptorBindingKind kind);
-
-void AddDescriptorAnnotationsAndNames(EmitterState& state);
-
-void DefineModule(EmitterState& state);
+uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
+                                 const char* name);
+void     DefineModule(EmitterState& state);
+void     DefineTessellationInterfaces(EmitterState& state);
+void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state);
 void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
 
-DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control);
+DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
+                                    uint32_t lane_bits);
 
 DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
                                         bool left);
@@ -637,7 +647,7 @@ DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subi
 
 DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row);
 
-DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control);
+DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
@@ -669,15 +679,16 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
-uint32_t LdsStorageDwordCount(const EmitterState& state);
+void EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {
-	IR::ResourceKind kind             = IR::ResourceKind::None;
-	uint32_t         object_pointer   = 0;
-	uint32_t         length           = 0;
-	uint32_t         index_offset     = 0;
-	uint32_t         byte_offset      = 0;
-	bool             add_index_offset = false;
+	IR::ResourceKind      kind             = IR::ResourceKind::None;
+	uint32_t              object_pointer   = 0;
+	uint32_t              length           = 0;
+	uint32_t              index_offset     = 0;
+	uint32_t              byte_offset      = 0;
+	bool                  add_index_offset = false;
+	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
@@ -812,22 +823,18 @@ template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();
-	const auto then_exit   = state.builder.AllocateId();
-	const auto else_label  = state.builder.AllocateId();
+	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
-	state.builder.AddFunction({OpBranchConditional, condition, then_label, else_label});
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
 	EmitLabel(state, then_label);
 	const auto then_value = fn();
-	state.builder.AddFunction({OpBranch, then_exit});
-	EmitLabel(state, then_exit);
-	state.builder.AddFunction({OpBranch, merge_label});
-	EmitLabel(state, else_label);
-	state.builder.AddFunction({OpBranch, merge_label});
+	const auto then_exit  = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpPhi, type, value, then_value, then_exit, default_value, else_label});
+	state.builder.AddFunction(spv::OpPhi, type, value, then_value, then_exit, default_value,
+	                          header);
 	return value;
 }
 
