@@ -9,36 +9,17 @@ on:
 
 permissions:
   contents: write
-  actions: write
-  workflows: write
 
 jobs:
   port:
     runs-on: ubuntu-latest
     steps:
-      - name: Push YOTEI-BRANCH to fork as yotei
+      - name: Push YOTEI-BRANCH to fork as yotei (workflow files excluded)
         shell: bash
         run: |
           set -euo pipefail
           git clone --single-branch --branch YOTEI-BRANCH https://github.com/peepostarexx/KytyPS5.git repo
           cd repo
+          git rm -r -q .github/workflows
+          git -c user.name=RainKikyou -c user.email=RainKikyou@users.noreply.github.com commit -q -m "port-yotei: drop workflow files (GITHUB_TOKEN cannot push them)"
           git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" YOTEI-BRANCH:refs/heads/yotei
-
-      - name: Trigger build on yotei branch
-        shell: bash
-        run: |
-          set -euo pipefail
-          ok=0
-          for i in 1 2 3 4 5 6; do
-            if curl -sf -X POST \
-              -H "Authorization: Bearer ${{ github.token }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
-              -d '{"ref":"yotei"}'; then
-              ok=1
-              break
-            fi
-            echo "dispatch attempt $i failed; retry in 15s"
-            sleep 15
-          done
-          test "$ok" -eq 1
