@@ -1,4 +1,4 @@
-#include "common/archive.h"
+﻿#include "common/archive.h"
 #include "common/common.h"
 #include "common/consoleColors.h"
 #include "common/dateTime.h"
@@ -684,10 +684,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--red-zone-protection") {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (!ParseBool(value, options.config.red_zone_protection_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+#endif
 		} else if (arg == "--record-thread") {
 			if (!ParseBool(value, options.config.record_thread_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
